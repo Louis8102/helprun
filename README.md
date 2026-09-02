@@ -1,96 +1,126 @@
 # helprun
 
-Run a Stata help example by clicking it in the Viewer.
+**Run complete Stata help examples with a single click in the Viewer.**
 
-Open a help page and type `helprun`. A temporary copy of that page opens in the
-Viewer with a **Run this example** link under every example helprun can run.
-Clicking one link runs exactly that example in a hidden child Stata process and
-brings its output back to your Results window.
+`helprun` lets you open a Stata help page, prepare its runnable examples, and then run the complete example you choose by clicking **Run this example** in the Viewer. It is designed to avoid manual copy/paste and reconstruction of multi-line example code while protecting the parent Stata session.
+
+## Installation
+
+Install the current version directly from the GitHub repository:
+
+```stata
+net install helprun, from("https://raw.githubusercontent.com/Louis8102/helprun/main") replace
+```
+
+GitHub repository:
+
+https://github.com/Louis8102/helprun
+
+After installation, verify which files Stata is using:
+
+```stata
+which helprun
+findfile _helprun.py
+```
+
+If Stata reports an older copy from another ado directory, remove or replace that stale copy before using the newly installed version.
+
+## Basic use
+
+Use `helprun` in three steps:
+
+```stata
+help topic
+helprun
+```
+
+Then, in the temporary Viewer, find the example you want and click **Run this example** at the end of that example.
+
+For example:
 
 ```stata
 help regress
 helprun
 ```
 
-Then click the link under the example you want.
+`helprun` does not execute an example merely because you type `helprun`. Execution begins only after you click a specific **Run this example** link.
 
-No code is copied into the Do-file Editor and no example number is typed. The
-example is chosen by clicking it, so what runs is the example you were looking
-at. The original help file is never modified, and your interactive session keeps
-its data, its working directory and its estimation results.
+## Key features
 
-## What it does
+- **One-click complete examples.** Run complete examples from official Stata help and installed user-written help without rebuilding the code manually.
+- **Protected execution with clear diagnostics.** Examples run outside the interactive parent session. If required data, runtime components, or other prerequisites are unavailable, `helprun` reports the reason instead of silently guessing.
+- **Automatic output preservation.** Run output is returned to Results and a plain-text log is saved in the working directory current when the example is clicked. Capturable Stata graphs are preserved as `.gph` and `.png`. Clearly authored outputs can include `.dta`, `.csv`, `.xlsx`, `.docx`, `.pdf`, `.tex`, `.html`, and `.svg`. Existing files are not overwritten; when needed, `-run-2`, `-run-3`, and later suffixes are used.
 
-- Reconstructs the whole example: multiline commands, continuation lines, `.`
-  prompts, loops, `program`/`input`/Mata blocks and `#delimit ;` sections.
-- Runs the earlier setup examples the clicked one actually needs, and no others.
-- Isolates the run: a hidden child Stata with a private working directory, so
-  the example's `clear`, `cd` and file writes do not reach your session.
-- Refuses rather than guesses. An example that cannot be reconstructed
-  unambiguously, or that needs your data, a licence, a credential or a decision,
-  is refused with a stated reason.
-- Keeps the output: the run appears in Results, and its log, graphs and any files
-  the example created are saved to the working directory you clicked from.
-
-## Requirements
-
-- Stata 16 or newer, for Windows.
-- Stata's Python integration working. Check with `python query`.
-
-Identifying the help Viewer that belongs to your Stata process uses
-Windows-specific facilities, so helprun is Windows-only. See the Known
-limitations section of `help helprun` for the full list.
-
-## Install
-
-Copy the three runtime files onto your ado path:
+Typical log names look like:
 
 ```text
-helprun.ado
-_helprun.py
-helprun.sthlp
+regress-example-2.log
+nestpreserve-example-1.log
 ```
 
-Then `help helprun` for the full documentation.
+## Examples
 
-## Repository layout
-
-```text
-helprun.ado          the command
-_helprun.py          the engine, run inside Stata's Python
-helprun.sthlp        the help file
-test_helprun.do      the single master validation entry point
-tests/               the automated acceptance suite
-fixtures/            controlled help fixtures used by the suite
-VALIDATION.md        what has been validated, and how
-```
-
-To run the suite, set the working directory to the repository root and run the
-entry point, or point it at the root explicitly:
+### Official Stata help
 
 ```stata
-cd <repository root>
-do test_helprun.do
+help regress
+helprun
 ```
+
+Choose any runnable example in the Viewer and click **Run this example**.
+
+### Installed user-written help
 
 ```stata
-global HELPRUN_PROJECT "<repository root>"
-do <repository root>/test_helprun.do
+help nestpreserve
+helprun
 ```
 
-Some cases need a real help Viewer, which batch mode does not provide, so the
-entry point launches short GUI Stata sub-runs and merges their results. It
-locates Stata itself; `global HELPRUN_STATA_EXE` overrides that if needed.
+`helprun` prepares the examples found in the installed help file in the same way.
+
+### Help containing existing Stata command links
+
+```stata
+help reg2docx
+helprun
+```
+
+Existing native Stata links are preserved, while `helprun` adds one **Run this example** control for the complete structural example.
+
+### Delegated or shared help content
+
+```stata
+help sem
+helprun
+```
+
+`helprun` can follow help content that is resolved through delegated or shared help files.
+
+## Compatibility
+
+Version 1.0.0 has been validated on:
+
+- Windows 10
+- StataNow 19.5
+- Stata's Python integration
+
+Other operating systems and Stata releases are not claimed by this validation.
 
 ## Version
 
-2.0.0
+**1.0.0**
 
 ## Author
 
-Hao Ma, PhD — shouhuoxiwang2027@gmail.com
+Hao Ma, Ph.D.  
+Email: shouhuoxiwang2027@gmail.com
+
+## Suggested citation
+
+If you use `helprun` in research, please cite:
+
+Ma, H. (2026). *helprun: Run complete Stata help examples with a single click in the Viewer*. Statistical Software Components **S______**, Boston College Department of Economics. Version 1.0.0.
 
 ## License
 
-helprun is free software licensed under the GNU General Public License version 3
-(GPL-3.0).
+`helprun` is free software licensed under the GNU General Public License version 3 (GPL-3.0).
