@@ -1,0 +1,7 @@
+v 3
+d HELPRUN -- run a Stata help example by clicking it in the Viewer
+d
+d Author: Hao Ma, PhD
+d Support: email shouhuoxiwang2027@gmail.com
+d
+p helprun Run a complete Stata help example by clicking it in the Viewer

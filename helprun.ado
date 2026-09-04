@@ -1,4 +1,4 @@
-*! version 2.0.0
+*! version 1.0.0
 *! helprun -- run a Stata help example by clicking it in the Viewer
 *!
 *! Usage:
@@ -75,7 +75,7 @@ program define helprun_prepare, sclass
     local hr_reason ""
     local hr_error ""
 
-    python: import importlib.util as _I; from sfi import Macro as _M; _s=_I.spec_from_file_location("_helprun_runtime",_M.getLocal("helper")); _m=_I.module_from_spec(_s); _s.loader.exec_module(_m); _z=_m.ado_prepare([_M.getLocal("base"),_M.getLocal("site"),_M.getLocal("plus"),_M.getLocal("personal")]); [_M.setLocal("hr_"+_k,_v) for _k,_v in _z.items()]
+    python: import importlib.util as _I; from sfi import Macro as _M; _s=_I.spec_from_file_location("_helprun_runtime",_M.getLocal("helper")); _m=_I.module_from_spec(_s); _s.loader.exec_module(_m); _z=_m.ado_prepare([_M.getLocal("base"),_M.getLocal("site"),_M.getLocal("plus"),_M.getLocal("personal")]); exec("for _k,_v in _z.items(): _M.setLocal('hr_'+_k,_v)")
 
     if "`hr_ok'" != "1" {
         di as err `"`hr_error'"'
@@ -111,37 +111,47 @@ program define helprun_click, sclass
     local hr_logfile ""
     local hr_plan ""
     local hr_artifacts ""
+    local hr_resultsfile ""
+    local hr_location ""
+    local hr_causal ""
+    local hr_rcode ""
 
-    python: import importlib.util as _I; from sfi import Macro as _M; _s=_I.spec_from_file_location("_helprun_runtime",_M.getLocal("helper")); _m=_I.module_from_spec(_s); _s.loader.exec_module(_m); _z=_m.ado_click(_M.getLocal("token"),_M.getLocal("pwd"),[_M.getLocal("base"),_M.getLocal("site"),_M.getLocal("plus"),_M.getLocal("personal")]); [_M.setLocal("hr_"+_k,_v) for _k,_v in _z.items()]
+    python: import importlib.util as _I; from sfi import Macro as _M; _s=_I.spec_from_file_location("_helprun_runtime",_M.getLocal("helper")); _m=_I.module_from_spec(_s); _s.loader.exec_module(_m); _z=_m.ado_click(_M.getLocal("token"),_M.getLocal("pwd"),[_M.getLocal("base"),_M.getLocal("site"),_M.getLocal("plus"),_M.getLocal("personal")]); exec("for _k,_v in _z.items(): _M.setLocal('hr_'+_k,_v)")
 
-    * Output bridge: the user sees what the clicked example produced without
-    * having to open the log file.
-    if `"`hr_logfile'"' != "" {
-        capture confirm file `"`hr_logfile'"'
+    * ------------------------------------------------------------------
+    * Output bridge, specification section 12.1A.
+    *
+    * Results shows the authored commands and their ordinary Stata results
+    * ONCE, then one concise location line. It must look like normal
+    * interactive Stata: no run-log header, no internal child framing, no
+    * duplicate COMMANDS EXECUTED / CHILD OUTPUT streams, no instrumentation,
+    * and no artifact manifest. Those all remain in the persistent log.
+    * ------------------------------------------------------------------
+    if `"`hr_resultsfile'"' != "" {
+        capture confirm file `"`hr_resultsfile'"'
         if !_rc {
-            di as txt ""
-            di as txt "{hline 60}"
-            type `"`hr_logfile'"'
-            di as txt "{hline 60}"
+            type `"`hr_resultsfile'"'
+            capture erase `"`hr_resultsfile'"'
         }
     }
 
-    if "`hr_status'" == "SUCCESS" {
-        di as txt "helprun: " as res "SUCCESS" ///
-            as txt "  examples run: [" as res "`hr_plan'" as txt "]"
-        if `"`hr_artifacts'"' != "" {
-            di as txt "helprun: artifacts saved: " as res `"`hr_artifacts'"'
+    if "`hr_status'" != "SUCCESS" {
+        * The meaningful causal Stata message, not `end of do-file`.
+        if `"`hr_causal'"' != "" {
+            di as err `"`hr_causal'"'
+            if `"`hr_rcode'"' != "" {
+                di as err "r(`hr_rcode');"
+            }
+        }
+        else if `"`hr_message'"' != "" {
+            di as err `"`hr_message'"'
         }
     }
-    else {
-        di as err `"`hr_message'"'
-        di as txt "helprun: " as err "`hr_status'" ///
-            as txt " / " as err "`hr_failure_class'" ///
-            as txt " / " as err "`hr_reason'"
-    }
 
-    if `"`hr_logfile'"' != "" {
-        di as txt "helprun: log saved to " as res `"`hr_logfile'"'
+    * Exactly one concise absolute location line. No `ARTIFACTS: none`, no
+    * standalone `none`, and no file-by-file manifest.
+    if `"`hr_location'"' != "" {
+        di as txt `"`hr_location'"'
     }
 
     sreturn local status  `"`hr_status'"'

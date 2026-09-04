@@ -39,6 +39,35 @@ if _rc {
     exit 601
 }
 
+* ------------------------------------------------------------------
+* The validation trees must be present.
+*
+* This file is a MANDATORY member of the SSC package, but the tests/ and
+* fixtures/ trees it orchestrates ship only in the paired GitHub release. An
+* SSC user who runs it therefore has the entry point without its inputs, and
+* the one thing that must never happen is that it looks like it passed. It
+* refuses here, names what is missing, and says exactly where to get it.
+* ------------------------------------------------------------------
+capture confirm file `"`PROJECT'\tests\gate3_static.py"'
+local hr_no_tests = _rc
+capture confirm file `"`PROJECT'\fixtures\g3_out.sthlp"'
+local hr_no_fixtures = _rc
+
+if `hr_no_tests' | `hr_no_fixtures' {
+    di as err "helprun: this is the master validation entry point, and its"
+    di as err "validation trees are not present under:"
+    di as err "    `PROJECT'"
+    if `hr_no_tests'    di as err "    missing: tests\"
+    if `hr_no_fixtures' di as err "    missing: fixtures\"
+    di as err ""
+    di as err "The SSC package ships the runtime plus this entry point. The"
+    di as err "tests and fixtures ship in the paired GitHub release. Obtain"
+    di as err "them and run this file from that tree."
+    di as err ""
+    di as err "NOTHING WAS VALIDATED."
+    exit 601
+}
+
 local RUNDIR  "`PROJECT'\validation\gate3_run"
 
 * Publish the root so every test file and every launched sub-process can
@@ -150,6 +179,17 @@ _do = os.path.join(_wd, "gate3_run_viewer.do")
 
 try:
     _p = subprocess.Popen([_exe, "do", _do, _root], cwd=_wd)
+    # Specification 0.6.2: every automation-launched Stata is owned,
+    # and its ownership record is what later authorises closing it
+    # and proves it exited.
+    import json as _json, time as _t
+    _lc = os.path.join(_root, "validation", "gate7_run", "lifecycle")
+    os.makedirs(_lc, exist_ok=True)
+    with open(os.path.join(_lc, "suite_launches.jsonl"), "a",
+              encoding="utf-8") as _fh:
+        _fh.write(_json.dumps({"pid": _p.pid,
+                               "purpose": os.path.basename(_do),
+                               "start_time": _t.time()}) + chr(10))
     _p.wait(timeout=240)
     Macro.setLocal("viewer_rc", str(_p.returncode))
 except Exception as _exc:
@@ -195,6 +235,17 @@ _do = os.path.join(_wd, "gate4_run_viewer.do")
 
 try:
     _p = subprocess.Popen([_exe, "do", _do, _root], cwd=_wd)
+    # Specification 0.6.2: every automation-launched Stata is owned,
+    # and its ownership record is what later authorises closing it
+    # and proves it exited.
+    import json as _json, time as _t
+    _lc = os.path.join(_root, "validation", "gate7_run", "lifecycle")
+    os.makedirs(_lc, exist_ok=True)
+    with open(os.path.join(_lc, "suite_launches.jsonl"), "a",
+              encoding="utf-8") as _fh:
+        _fh.write(_json.dumps({"pid": _p.pid,
+                               "purpose": os.path.basename(_do),
+                               "start_time": _t.time()}) + chr(10))
     _p.wait(timeout=300)
     Macro.setLocal("viewer4_rc", str(_p.returncode))
 except Exception as _exc:
@@ -244,6 +295,90 @@ di as txt "{hline 78}"
 di as txt "Permanent production and help invariants"
 di as txt "{hline 78}"
 python script "`PROJECT'\tests\gate7_invariants.py"
+
+* ------------------------------------------------------------------
+* Bounded help-document contract (HLP-01..HLP-17) and the harness self-audit.
+*
+* These were previously reachable only by launching their scripts separately,
+* which the mandatory entry-point rule forbids: one invocation must orchestrate
+* the complete automated suite. HLP-16 stays PENDING-GATE8 by design, because
+* it compares the two built archive members.
+* ------------------------------------------------------------------
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Public help contract"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\help_contract_hlp.py"
+
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Validation harness self-audit"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\gate7_harness_audit.py"
+
+* ------------------------------------------------------------------
+* Frozen-oracle and public-summary integrity.
+*
+* The oracle manifest is derived from the specification rather than maintained
+* beside it, and the public validation index derives its counts from the
+* recorded results. Both are verified here, never regenerated: a suite run may
+* report drift, it may not quietly erase it.
+* ------------------------------------------------------------------
+* ------------------------------------------------------------------
+* Harness sanity.
+*
+* Runs FIRST, and deliberately so. A patch once deleted three functions
+* from the Viewer verifier; the file still parsed, so nothing caught it,
+* and the failure surfaced as NameError / r(7103) in front of a person who
+* had opened Stata to take a manual checkpoint. A broken harness must fail
+* in seconds here, before anything else runs on top of it.
+* ------------------------------------------------------------------
+* ------------------------------------------------------------------
+* Defect intake and post-verdict change control.
+*
+* Specification 0.6.1 required the defect lifecycle to run at discovery
+* time, for a defect found by anyone. It is prose addressed to the agent,
+* so nothing executed it, and it did not fire: a harness regression reached
+* the user unrecorded. These two make the obligation executable -- an
+* unreconciled incident, or a controlled artifact that moved after a verdict
+* without its entry point being run, fails here.
+* ------------------------------------------------------------------
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Defect intake and change control"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\incident_intake.py"
+python script "`PROJECT'\tests\run_entrypoints.py"
+
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Harness sanity"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\harness_sanity.py"
+
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Frozen oracle manifest"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\freeze_oracles.py"
+
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Public validation summary"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\validation_summary.py"
+
+* ------------------------------------------------------------------
+* Process lifecycle: verify every Stata this suite launched has exited,
+* report any Stata it does NOT own without touching it, and record the
+* evidence. Specification 0.6.2 L05/L08.
+* ------------------------------------------------------------------
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Stata process lifecycle"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\suite_cleanup.py"
+python script "`PROJECT'\tests\gate7_lifecycle.py"
 
 * ------------------------------------------------------------------
 * Consolidated result.

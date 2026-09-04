@@ -1,0 +1,27 @@
+v 3
+d helprun -- Run a complete Stata help example by clicking it in the Viewer
+d
+d helprun turns the examples in any Stata help file into clickable controls.
+d Open a help topic, type helprun, then click "Run this example" beside the
+d example you want. The help file is never modified and the example runs in a
+d hidden Stata, so your data and results are untouched. Each run is saved in a
+d directory named for the help topic beneath your working directory.
+d
+d Requires Windows and Stata's Python integration.
+d
+d test_helprun.do ships as an ancillary member: retrieve it with
+d net get helprun. It reproduces the validation suite against the
+d exact copy you installed, needs the tests and fixtures from the
+d GitHub release, and refuses with a clear message without them.
+d
+d Distribution-Date: 20260903
+d Version: 1.0.0
+d
+d Author: Hao Ma, PhD
+d Support: email shouhuoxiwang2027@gmail.com
+d License: GPL-3.0
+d
+f helprun.ado
+f _helprun.py
+f helprun.sthlp
+f test_helprun.do

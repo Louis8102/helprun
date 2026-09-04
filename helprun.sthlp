@@ -1,241 +1,156 @@
 {smcl}
-{* *! version 2.0.0 01sep2026}{...}
+{* *! version 1.0.0 03sep2026}{...}
 {vieweralsosee "help" "help help"}{...}
 {vieweralsosee "view" "help view"}{...}
-{vieweralsosee "do" "help do"}{...}
 {vieweralsosee "python" "help python"}{...}
 
 {title:Title}
 
 {phang}
-{bf:helprun} {hline 2} Run a Stata help example by clicking it in the Viewer{p_end}
+{bf:helprun} {hline 2} Run a complete Stata help example by clicking it in the Viewer{p_end}
 
 {title:Description}
 
 {pstd}
-HELPRUN runs the example you are reading. Open a help page and type
-{cmd:helprun}: a temporary copy of that page opens in the Viewer, and every
-example helprun can run gains a {bf:Run this example} link. Clicking one link
-runs exactly that example in a hidden child Stata process and brings its output
-back to your Results window.{p_end}
+{cmd:helprun} lets you run the examples you are reading in a Stata help file
+without copying anything into the Do-file Editor. Open any help topic, type
+{cmd:helprun}, and a temporary copy of that help page appears with a
+{bf:Run this example} control beside each complete example. Click the one you
+want and it runs.{p_end}
 
 {pstd}
-No code is copied into the Do-file Editor and no example number is typed. The
-example is chosen by clicking it, so what runs is the example you were looking
-at. The original help file is never modified, and your interactive session keeps
-its data, its working directory, and its estimation results.{p_end}
+The help file you are reading is never modified, and the example never runs in
+your session. Each click runs in a separate hidden Stata, so your data, your
+results and your working directory are left exactly as they were.{p_end}
+
+{pstd}
+Each click saves its output. {cmd:helprun} creates a directory named for the
+help topic beneath your current working directory and writes the run log there,
+together with any graphs the example produced and any file it clearly set out
+to create. Existing files are never overwritten: a second run of the same
+example is saved alongside the first under a {cmd:-run-2} name. After the run,
+Results prints one line naming that directory:{p_end}
+
+{pstd}{bf:helprun: log and other output files saved in} {it:directory}{p_end}
+
+{title:Why use helprun?}
+
+{pstd}
+Help examples are written to be read, not to be run. To try one you normally
+have to select the right lines, strip the leading dots and continuation
+markers, notice that the example depends on a dataset loaded three paragraphs
+earlier, paste the result somewhere, and hope you did not disturb the data you
+already had open.{p_end}
+
+{pstd}
+{cmd:helprun} removes that work. It reads the example as the author wrote it,
+adds only the earlier setup that example actually needs, and runs the whole
+thing in one step. When an example cannot run, it tells you plainly why
+instead of failing in a way you have to diagnose yourself.{p_end}
 
 {title:Key features}
 
-{p 4 8 2}• {bf:Click, do not copy.} The link sits under the example itself, so no
-code, setup line, or data command has to be selected and pasted anywhere.{p_end}
-{p 4 8 2}• {bf:The whole example.} Multiline commands, continuation lines,
-{cmd:.} prompts, loops, {cmd:program}/{cmd:input}/Mata blocks, and
-{cmd:#delimit ;} sections are reconstructed as the author wrote them.{p_end}
-{p 4 8 2}• {bf:Setup included.} When the clicked example depends on setup shown
-in an earlier example, helprun first runs only the earlier examples it actually
-needs.{p_end}
-{p 4 8 2}• {bf:Session isolation.} The example runs in a hidden child Stata with
-a private working directory, so its {cmd:clear}, {cmd:cd}, and file writes do
-not reach your session.{p_end}
-{p 4 8 2}• {bf:Evidence, not guessing.} An example that cannot be reconstructed
-unambiguously, or cannot be run without your decision, is refused with a stated
-reason instead of being run on a guess.{p_end}
-{p 4 8 2}• {bf:The output is kept.} The run appears in the Results window, and
-its log, graphs, and any files the example created are saved next to your
-work.{p_end}
+{p 4 8 2}• {bf:One click, whole example.} Run a complete structural example straight from
+the Viewer, with no copying, no editing and no example number to type.{p_end}
+
+{p 4 8 2}• {bf:Reads real help files.} Reconstructs examples conservatively
+across the formats Stata help actually uses, including continuation lines,
+blocks, native clickable command links, and setup written earlier in the page.{p_end}
+
+{p 4 8 2}• {bf:Isolated and saved.} Runs in a hidden Stata that cannot touch
+your session, preserves the log, graphs and authored output, and reports a
+clear, evidence-based reason when an example cannot run.{p_end}
 
 {title:Syntax}
 
-{p 4 4 2}{cmd:helprun}{break}
-Prepare the help page currently open in this Stata's Viewer. helprun resolves
-the help source through Stata, reconstructs each example, and opens a temporary
-clickable copy in the Viewer. This step executes nothing: no example runs, no
-child Stata starts, nothing is downloaded, and nothing is written outside
-Stata's temporary directory. There are no options, and there is deliberately no
-example number to type: the example is identified by the link you click.{p_end}
-
-{title:Getting started}
+{p 4 4 2}
+{cmd:helprun}{p_end}
 
 {pstd}
-Read a help page and run one of its examples:{p_end}
+{cmd:helprun} takes no options. The ordinary sequence is{p_end}
 
-{p 4 4 2}help regress{p_end}
-{p 4 4 2}helprun{p_end}
-
-{pstd}
-The Viewer shows the same page you were reading, with its own blue help links
-intact, and a {bf:Run this example} link under each runnable example. helprun
-also reports in the Results window how many runnable examples it found. Click
-the link under the example you want; its commands run, its output is printed in
-the Results window, and the log is saved to your current working directory.{p_end}
+{p 8 8 2}{cmd:help} {it:topic}{p_end}
+{p 8 8 2}{cmd:helprun}{p_end}
+{p 8 8 2}then click the {bf:Run this example} control beside the example you want.{p_end}
 
 {pstd}
-Type {cmd:helprun} again at any time to rebuild the clickable copy from the
-current help source.{p_end}
+Typing {cmd:helprun} only prepares the clickable view. Nothing is executed,
+downloaded or installed until you click a specific example.{p_end}
 
-{title:How helprun decides what to run}
-
-{pstd}
-helprun does not search for a help file by name. It reads the topic from the
-help Viewer belonging to this Stata process, asks Stata to resolve that topic,
-and then follows only the help links the author actually wrote, so a delegated
-or shared help page is read where the author pointed rather than guessed
-at.{p_end}
+{title:Practical applications}
 
 {pstd}
-Every file that contributes to the page you are reading, the main help file and
-each {cmd:INCLUDE help} or {cmd:.ihlp} fragment it pulls in, is recorded, and
-the link under an example carries an identity derived from that whole set of
-sources together with the example's position in it. Clicking a link therefore
-runs the example as it was when the page was prepared. If the help source
-changes underneath a clickable view, the click is refused rather than run
-against text you never saw.{p_end}
+The examples below are real topics on a system where {cmd:helprun} has been
+tested. They show an ordinary official help topic, a third-party topic whose
+example is written as native clickable commands, and a topic whose example
+cannot run because the help file supplies no data.{p_end}
+
+{title:Example 1. Running an official Stata help example}
+
+{p 4 4 2}{cmd:help regress}{p_end}
+{p 4 4 2}{cmd:helprun}{p_end}
+{pstd}Click the "Run this example" icon for Example 2.{p_end}
 
 {pstd}
-Only clicking a link runs anything, and each click runs exactly one example plus
-the earlier setup examples that example needs.{p_end}
+The {cmd:regress} help page offers four runnable examples. Example 2 is the
+robust standard errors example, which loads its own data and then fits several
+models. Results shows the commands and their output as if you had typed them,
+and the run is saved in a {cmd:regress} directory beneath your working
+directory.{p_end}
 
-{title:What you see and what is saved}
+{title:Example 2. Running a third-party example written as clickable commands}
 
-{pstd}
-The clicked example runs in a hidden child Stata. When it finishes, its log is
-printed in your Results window, so estimation tables, summary statistics,
-displayed output, and any Stata error messages are visible without opening a
-file.{p_end}
-
-{pstd}
-The log is also saved to the working directory that was current when you
-clicked, as{p_end}
-
-{p 8 8 2}{it:topic}{cmd:-example-}{it:N}{cmd:.log}{p_end}
+{p 4 4 2}{cmd:help reg2docx}{p_end}
+{p 4 4 2}{cmd:helprun}{p_end}
+{pstd}Click the "Run this example" icon for Example 1.{p_end}
 
 {pstd}
-where {it:N} is the position of the example in the help page. Graphs the example
-drew are saved beside it as
-{it:topic}{cmd:-example-}{it:N}{cmd:-graph-}{it:k} in {cmd:.gph} and {cmd:.png}
-form, and data or document files the example itself created are copied out under
-their own names. helprun never overwrites an existing file and never rotates or
-deletes one: if a name is already taken, the whole set of files for that run is
-written under {it:topic}{cmd:-example-}{it:N}{cmd:-run-}{it:k} instead.{p_end}
+This help page writes its whole example as a long sequence of individually
+clickable commands. Those original blue links are left exactly as the author
+wrote them; {cmd:helprun} simply adds one control that runs the example as a
+single unit, in the authored order, rather than making you click twenty-four
+commands one at a time.{p_end}
+
+{title:Example 3. An example the help file cannot supply data for}
+
+{p 4 4 2}{cmd:help minvar}{p_end}
+{p 4 4 2}{cmd:helprun}{p_end}
+{pstd}Click the "Run this example" icon for Example 1.{p_end}
 
 {pstd}
-Everything else the run produced stays in the temporary sandbox and is removed
-with it.{p_end}
+The {cmd:minvar} help page shows its command applied to variables such as
+{cmd:anx1_1} and {cmd:anx2_1}, but the page never loads a dataset and never
+generates one, so there is nothing for the example to run against. Rather than
+inventing data or reporting an obscure error, {cmd:helprun} says so:{p_end}
 
-{title:When helprun refuses}
-
-{pstd}
-A click ends in one of three states: {cmd:SUCCESS}, {cmd:FAILED} when execution
-was attempted and did not succeed, or {cmd:REFUSED} when helprun declined to
-attempt it. A run that is not a success always reports the class of the problem
-and a specific reason, so the message says what stood in the way rather than
-that something went wrong.{p_end}
-
-{synoptset 16 tabbed}{...}
-{synopt:{cmd:SOURCE}}the help page itself could not be read, resolved, or
-trusted{p_end}
-{synopt:{cmd:EXAMPLE}}the authored example has no runnable code, could not be
-reconstructed unambiguously, or its own code failed{p_end}
-{synopt:{cmd:DEPENDENCY}}data, a package file, an earlier prerequisite, or a
-network resource the example needs is not available{p_end}
-{synopt:{cmd:RUNTIME}}the example needs a Stata version, platform, external
-application, licence, or credential that is not present{p_end}
-{synopt:{cmd:SAFETY}}the example asks for something helprun will not do on its
-own, or that requires your decision first{p_end}
-{synopt:{cmd:EXECUTION}}the run could not be carried out as one isolated
-execution, for example a timeout or a dependency on state from another
-process{p_end}
-{synopt:{cmd:OUTPUT}}the log or an artifact could not be written where it
-belongs{p_end}
-{synopt:{cmd:INTERNAL}}a defect in helprun itself{p_end}
+{pstd}{bf:helprun: this example does not provide a runnable dataset or data setup.}{p_end}
 
 {pstd}
-Refusals are ordinary and expected. Real help files show examples that need your
-own data, a licensed dataset, a network resource, or a decision that is not
-helprun's to make, and naming the reason is more useful than running something
-approximate.{p_end}
-
-{title:Safety}
-
-{pstd}
-Help files belonging to Stata and to other packages are read only. helprun
-writes its clickable copy to a temporary file of its own and never edits the
-help source it read.{p_end}
-
-{pstd}
-Each click gets a fresh private working directory and a private temporary
-directory, and the example runs in a hidden child Stata process with no console
-window of its own. Every child process belonging to one click shares that
-private state; separate clicks and your own session do not. If an authored
-example deliberately ends a Stata process with a top-level {cmd:exit} and
-continues afterwards, helprun treats that as a process boundary: the first child
-is allowed to end and the remaining commands continue in a fresh child. Your
-interactive Stata is never the process that exits.{p_end}
-
-{pstd}
-Whether a command may run is decided by what the command is for and where its
-target came from, not by a list of forbidden file extensions. An installed
-package component that an example legitimately calls is treated as a package
-component; something with no such provenance is not, whatever it is called.
-Installing, updating, or persistently reconfiguring anything is never done
-silently: those commands stop the run and are reported as needing your
-confirmation, so nothing is added to your Stata installation behind your
-back.{p_end}
-
-{pstd}
-A hidden child Stata protects your session from the ordinary accidents of
-running example code. It is {bf:not} an operating-system or malware sandbox, and
-it is not a security boundary. Do not use {cmd:helprun} as a way to execute help
-files or ado-code you have reason to distrust.{p_end}
-
-{title:Supported help content}
-
-{pstd}
-helprun reads Stata {cmd:.sthlp} files, legacy {cmd:.hlp} files, and the
-{cmd:INCLUDE help} and {cmd:.ihlp} fragments they include, and it follows
-authored delegation to a shared help page. Within a page it recognises examples
-presented as plain indented code, as SMCL command or input spans, and as
-numbered paragraph blocks such as {cmd:{c -(}p 4 4 2{c )-}}, with or without a
-leading {cmd:.} prompt, whether the code is indented with spaces or with
-tabs.{p_end}
-
-{pstd}
-Reconstruction rejoins continuation lines, keeps repeated commands in order, and
-holds blocks such as {cmd:program} ... {cmd:end}, {cmd:input} ... {cmd:end},
-Mata sections, and {cmd:#delimit ;} sections together. Where an author offers
-genuine alternatives for the same task, each alternative becomes its own
-clickable example rather than being run as one sequence.{p_end}
-
-{title:Known limitations}
-
-{p 4 8 2}• {bf:Windows.} helprun runs on Stata for Windows. Identifying the help
-Viewer that belongs to your Stata process uses Windows-specific facilities and
-has no equivalent on other platforms.{p_end}
-{p 4 8 2}• {bf:Python integration.} Stata's Python integration must be working,
-since helprun's engine runs inside it. Type {cmd:python query} to check.{p_end}
-{p 4 8 2}• {bf:One process.} A help Viewer must be open in the same Stata
-process. helprun cannot read a Viewer belonging to another Stata instance, and
-it does nothing useful in batch mode, where {cmd:help} is ignored.{p_end}
-{p 4 8 2}• {bf:One run at a time.} A click made while another click is still
-running is refused rather than queued.{p_end}
-{p 4 8 2}• {bf:Time limit.} A run that has not finished within a fixed time
-limit is stopped, and the whole process tree it started is stopped with
-it.{p_end}
-{p 4 8 2}• {bf:What helprun cannot supply.} Examples that need your own data, a
-licensed or credentialed resource, an external application, or a newer Stata
-than yours are refused.{p_end}
-{p 4 8 2}• {bf:Prose as much as code.} Some examples cannot have their commands
-recovered unambiguously. Those are refused rather than approximated.{p_end}
-{p 4 8 2}• {bf:No stored results.} helprun promises no {cmd:r()} results. Values
-it happens to return are internal and may change without notice; do not write
-code against them.{p_end}
+A diagnostic log is still written to the {cmd:minvar} directory, and the
+location is printed in Results. This is the expected outcome for an example
+that documents a command's syntax without providing data, and it is not a
+failure of the help file or of your setup.{p_end}
 
 {title:Compatibility}
 
 {pstd}
-HELPRUN requires Stata 16 or newer for Windows, with Stata's Python integration
-available.{p_end}
+{cmd:helprun} runs each example in a hidden Stata so your session is
+protected, but it is {bf:not} a malware sandbox and it makes no security
+guarantee about code an author wrote. Installing or downloading anything on your
+behalf is never done silently: whatever would change your Stata installation
+is described first and needs your confirmation.{p_end}
+
+{pstd}
+{cmd:helprun} has been developed and tested on Windows 10 with StataNow 19.5
+and Stata's Python integration available ({cmd:python query}). Identifying the
+help Viewer belonging to your Stata session uses Windows facilities. Other
+platforms and other Stata versions are not validated, and no wider
+compatibility is claimed.{p_end}
+
+{title:Version}
+
+{pstd}
+1.0.0{p_end}
 
 {title:Author}
 
@@ -245,12 +160,8 @@ Hao Ma, PhD{p_end}
 {pstd}
 Email: {browse "mailto:shouhuoxiwang2027@gmail.com":shouhuoxiwang2027@gmail.com}{p_end}
 
-{title:Version}
-
-{pstd}
-2.0.0{p_end}
-
 {title:License}
 
 {pstd}
-helprun is free software licensed under the GNU General Public License version 3 (GPL-3.0).{p_end}
+{cmd:helprun} is free software licensed under the GNU General Public License
+version 3 (GPL-3.0).{p_end}

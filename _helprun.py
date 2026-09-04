@@ -249,6 +249,12 @@ REASON_CLASS = {
     "NO_RUNNABLE_EXAMPLE": CLASS_EXAMPLE,
     "HELP_CODE_ERROR": CLASS_EXAMPLE,
     "AMBIGUOUS_EXAMPLE_RECONSTRUCTION": CLASS_EXAMPLE,
+    # Section 9: a data-dependent Example that supplies no dataset, no
+    # data-generating setup and no user-data instruction. It is a property of
+    # the authored EXAMPLE, not an internal error, so it must be registered
+    # here -- an unregistered reason would default to the INTERNAL class and
+    # be reported as a helprun defect.
+    "EXAMPLE_DATA_SETUP_MISSING": CLASS_EXAMPLE,
     # DEPENDENCY
     "DATA_FILE_MISSING": CLASS_DEPENDENCY,
     "HELP_DATA_MISMATCH": CLASS_DEPENDENCY,
@@ -590,6 +596,53 @@ def choose_run_basename(out_dir, topic, ordinal):
     )
 
 
+def topic_output_directory(parent_pwd, topic):
+    """The frozen section 12.1 output root: <click-time c(pwd)>\\<safe-root-topic>\\
+
+    Every HELPRUN-owned artifact of one clicked run -- the persistent log, the
+    captured graphs and the authored final artifacts -- lives in this one
+    directory, so nothing is scattered across the working-directory root.
+
+    The root help topic the user sees names the directory, even when the help
+    delegates to another physical file. The name is passed through the same
+    safe_basename() rule used for filenames, and the result is verified to stay
+    directly beneath the frozen parent, so a topic can never traverse out of it
+    or turn into an absolute path.
+    """
+    base = Path(parent_pwd) if parent_pwd else Path.cwd()
+    safe = safe_basename(topic)
+
+    candidate = base / safe
+
+    # A topic-derived name must resolve to a direct child of the frozen root.
+    try:
+        if candidate.resolve().parent != base.resolve():
+            raise HelprunError(
+                "OUTPUT_DIRECTORY_NOT_WRITABLE",
+                "helprun: the help topic does not yield a safe output "
+                "directory beneath the working directory",
+            )
+    except OSError:
+        pass
+
+    return candidate
+
+
+def ensure_topic_directory(parent_pwd, topic):
+    """Create the topic output directory, or report why it is unusable."""
+    directory = topic_output_directory(parent_pwd, topic)
+
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+
+    if not output_directory_writable(directory):
+        return None
+
+    return directory
+
+
 def output_directory_writable(out_dir):
     """Prove writability by actually writing, not by inspecting attributes."""
     directory = Path(out_dir)
@@ -876,6 +929,122 @@ def encode_click_identity(identity):
     packed = zlib.compress(raw, 9)
 
     return base64.urlsafe_b64encode(packed).decode("ascii").rstrip("=")
+
+
+# ============================================================
+# CLICK HANDLES
+# ============================================================
+#
+# The Viewer's Run control used to carry the whole encoded identity inline, so
+# clicking it echoed a 200-plus character token into Results. Stata echoes a
+# clicked {stata ...} link verbatim, so that noise was unavoidable as long as
+# the payload travelled in the command.
+#
+# The payload no longer travels in the command. It is written to a private
+# registry file and the link carries a short CONTENT-ADDRESSED handle: the
+# handle IS the hash of the payload. Nothing about the identity changed, only
+# how it is transported, so every protection is preserved:
+#
+#   anti-tampering       editing the stored payload changes its hash, so it no
+#                        longer matches the handle that names it and the click
+#                        is refused. Inventing a handle finds no file.
+#   exact-example binding the payload is byte-for-byte what was encoded before,
+#                        including root, ordinal, start, end and the aggregate
+#                        source hash.
+#   stale-source/engine  verify_click_identity() still rebuilds the source graph
+#                        and compares the aggregate hash, exactly as before.
+#
+# A handle is not a capability: it grants nothing that the payload it names did
+# not already grant, and it cannot be steered onto a different example, because
+# any edit that would do so breaks the hash.
+
+CLICK_HANDLE_CHARS = 16
+
+_CLICK_HANDLE_RE = re.compile(r"^[0-9a-f]{%d}$" % CLICK_HANDLE_CHARS)
+
+
+def click_registry_dir():
+    """Private per-user directory holding the click payloads."""
+    base = Path(tempfile.gettempdir()) / "helprun_clicks"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def store_click_identity(identity):
+    """Write one identity payload and return the handle that names it.
+
+    The handle is the leading hex of the payload's SHA-256, so the mapping is
+    content-addressed: the name cannot be separated from what it names.
+    """
+    payload = encode_click_identity(identity)
+    handle = hashlib.sha256(payload.encode("ascii")).hexdigest()[:CLICK_HANDLE_CHARS]
+
+    target = click_registry_dir() / (handle + ".txt")
+
+    try:
+        target.write_text(payload, encoding="ascii")
+    except OSError as exc:
+        raise HelprunError(
+            "HELPRUN_INTERNAL_ERROR",
+            "helprun: could not record the click identity",
+            detail=str(exc),
+        )
+
+    return handle
+
+
+def load_click_identity(handle):
+    """Recover the payload a handle names, proving it was not altered."""
+    text = "".join(str(handle).split()).lower()
+
+    if not _CLICK_HANDLE_RE.match(text or ""):
+        raise HelprunError(
+            "HELPRUN_INTERNAL_ERROR",
+            "helprun: malformed internal click handle",
+        )
+
+    source = click_registry_dir() / (text + ".txt")
+
+    if not source.is_file():
+        raise HelprunError(
+            "SOURCE_CHANGED",
+            "helprun: this Run control belongs to a help view that is no "
+            "longer available; reopen the help and run helprun again",
+            detail=text,
+        )
+
+    payload = source.read_text(encoding="ascii").strip()
+
+    # The handle is the payload's own hash. A payload edited in place no longer
+    # hashes to the name it is filed under, and is refused rather than run.
+    actual = hashlib.sha256(payload.encode("ascii")).hexdigest()[:CLICK_HANDLE_CHARS]
+
+    if actual != text:
+        raise HelprunError(
+            "SOURCE_CHANGED",
+            "helprun: this Run control no longer matches the example it was "
+            "created for; reopen the help and run helprun again",
+            detail=text,
+        )
+
+    return payload
+
+
+def prune_click_registry(keep_hours=24):
+    """Drop stale payloads so the registry cannot grow without bound."""
+    cutoff = time.time() - keep_hours * 3600
+
+    try:
+        entries = list(click_registry_dir().glob("*.txt"))
+    except OSError:
+        return
+
+    for entry in entries:
+        try:
+            if entry.stat().st_mtime < cutoff:
+                entry.unlink()
+        except OSError:
+            pass
 
 
 def decode_click_identity(token):
@@ -1205,6 +1374,62 @@ def next_paragraph_start(raw, current=True):
     return False
 
 
+# Closed-class English words that Stata never uses as bare command syntax.
+# Stata's own bare keywords -- if, in, by, bysort, using, to, on, at, over,
+# from, for, all, not, and, or, with, into, do, more -- are deliberately
+# EXCLUDED, so a real command can never be read as prose because of them.
+_PROSE_FUNCTION_WORDS = frozenset("""
+    the this that these those it its their your our my his her
+    is are was were been being
+    has have had having
+    will would shall should can could may might must
+    of about above below between through during
+    before after while because although though unless whether
+    who whom whose which what when where why how
+    than then however therefore thus also
+    each every both either neither none other another
+    such same many much few several
+    he she we they you them
+""".split())
+
+
+def prose_continuation(text):
+    """Does the plain text following a marked command span read as English?
+
+    SMCL authors open a paragraph with the command's own name in a {cmd:...}
+    span in two structurally identical ways:
+
+        {pstd}{cmd:mycmd} price mpg, robust         <- a command with arguments
+        {pstd}{cmd:mycmd} reports the mean of ...   <- an English sentence
+
+    Both are "a marked span at the start of a paragraph body followed by plain
+    text", so the opening marker cannot separate them. The general difference
+    is the CONTINUATION: Stata syntax is varlists, numbers, operators and
+    options, while a sentence is held together by closed-class English words.
+
+    Quoted strings are removed first. A title("Mean of the outcome") may
+    legitimately contain any English at all, because it is data, not syntax.
+    """
+    if not text.strip():
+        return False
+
+    bare = re.sub(r'"[^"]*"', " ", text)
+    words = re.findall(r"[A-Za-z]+", bare.lower())
+
+    if not words:
+        return False
+
+    hits = {w for w in words if w in _PROSE_FUNCTION_WORDS}
+
+    # Two distinct function words is already decisive. One is decisive only
+    # when the text also closes like a sentence, so that a real argument such
+    # as `[your working directory]` stays a command.
+    if len(hits) >= 2:
+        return True
+
+    return bool(hits) and len(words) >= 3 and bare.rstrip().endswith((".", "?", "!"))
+
+
 def line_is_marked_command(raw, at_paragraph_start=True):
     """Is this whole line an explicit {cmd:...} / {inp:...} command line?
 
@@ -1272,10 +1497,18 @@ def line_is_marked_command(raw, at_paragraph_start=True):
     #   {pstd}{cmd:sctorezone} -3, only(starttime) force
     #   {pstd} {inp:ieddtab} {it:varlist} , {inp:t(}{it:time}{inp:)}
     # Any other directive means the line is structural, not a command.
+    opening_close = _matching_brace(stripped, 0)
+
+    if opening_close < 0:
+        return False
+
     index = 0
+    plain = []
 
     while index < length:
         if stripped[index] != "{":
+            if index > opening_close:
+                plain.append(stripped[index])
             index += 1
             continue
 
@@ -1291,7 +1524,36 @@ def line_is_marked_command(raw, at_paragraph_start=True):
 
         index = close + 1
 
+    # The author's marker says the OPENING token is a command name. It does not
+    # say the rest of the paragraph is code, and real help constantly opens a
+    # descriptive sentence with the command's own name in a {cmd:...} span.
+    if prose_continuation("".join(plain)):
+        return False
+
     return True
+
+
+# The authoritative Viewer stops parsing SMCL on a source line longer than this,
+# and emits the raw text instead. Measured on StataNow 19.5 by opening a graded
+# .sthlp with `help` and reading the switchover: LEN246 is the last line rendered
+# as a clickable link, LEN247 and every longer line are shown literally. See
+# validation/gate2_reference_addendum_R20A_R20E.md (R20A).
+#
+# The limit belongs to the help/.sthlp rendering path specifically. `view` on a
+# .smcl does NOT impose it -- a graded probe there rendered 235..260 as links --
+# so it must never be re-derived from `view`, and the constant may only be
+# changed by re-measuring in the Viewer.
+VIEWER_MAX_SMCL_LINE = 246
+
+
+def viewer_parses_line(raw):
+    """Would the authoritative Viewer parse this source line as SMCL at all?
+
+    A line the Viewer refuses is shown to the reader as literal text, so it
+    offers no clickable link. Anything helprun recovered from it would be an
+    executable the user can never reach, which section 5 forbids inventing.
+    """
+    return len(str(raw).rstrip("\r\n")) <= VIEWER_MAX_SMCL_LINE
 
 
 def native_link_commands(raw):
@@ -1303,6 +1565,15 @@ def native_link_commands(raw):
     recognise plain-text code must not be applied to it.
     """
     if hidden(raw):
+        return []
+
+    # R20A. A native link is only authored-runnable if the Viewer actually
+    # presents it. Beyond the Viewer's line limit the directive is displayed
+    # literally, so there is no link for the reader to click and helprun must
+    # not manufacture one. This is a general length rule, not a rule about any
+    # package: the installed reg2docx.sthlp is where it was found, but nothing
+    # here refers to it.
+    if not viewer_parses_line(raw):
         return []
 
     return scan_stata_links(raw)[1]
@@ -1324,6 +1595,21 @@ def render(raw):
     # back afterwards. See protect_smcl_chars: a {cmd:...} span may legitimately
     # contain one, and the tag patterns cannot match across a brace.
     s, protected_chars = protect_smcl_chars(s)
+
+    # HPROD-04 again. The text-tag unwrap pattern is `[^{}]*`, so it cannot
+    # unwrap a span that still contains a nested directive, and the purely
+    # positional directives below were stripped only AFTER that loop. A span
+    # such as
+    #     {inp:idvars(make) version(15) {space 15}///}
+    # was therefore never unwrapped, and the literal `{inp:` survived into the
+    # reconstructed command. These directives carry no text of their own, so
+    # removing them first is safe and lets the unwrap proceed.
+    for _nested in (
+        r"\{space\s+[^}]*\}",
+        r"\{col\s+[^}]*\}",
+        r"\{break\}",
+    ):
+        s = re.sub(_nested, "", s, flags=re.IGNORECASE)
 
     changed = True
 
@@ -1961,6 +2247,24 @@ def plausible_indented(raw, visible):
     if visible.startswith("*") or visible.startswith("//"):
         return True
 
+    # An English sentence is not a command, whatever paragraph wrapper it sits
+    # in. Stata commands are lowercase, so a line that opens with an ordinary
+    # capitalised word and closes with sentence punctuation is prose.
+    #
+    # This generalises the earlier guard below, which required >= 14 words and
+    # no quotes and therefore let a short quoted instruction through as code --
+    # a real page produced the reconstructed "command"
+    #     Click the "Run this example" icon for Example 2.
+    # Block bodies (program/input/mata/python) never reach this function, so a
+    # legitimately capitalised Mata statement is unaffected.
+    tokens = visible.split()
+    if (
+        len(tokens) >= 3
+        and re.match(r"^[A-Z][a-z]+$", tokens[0])
+        and visible.rstrip().endswith((".", "?", "!"))
+    ):
+        return False
+
     words = re.findall(r"[A-Za-z]+", visible)
 
     if (
@@ -2008,14 +2312,93 @@ def alternative_branch_marker(raw, visible):
 _INPUT_OBS_PROMPT_RE = re.compile(r"^\d+\.\s+(.*)$")
 
 
+_BREAK_TAIL_RE = re.compile(r"\{break\}\s*$", flags=re.IGNORECASE)
+_P_END_RE = re.compile(r"\{p_end\}", flags=re.IGNORECASE)
+_MARKED_FRAGMENT_RE = re.compile(r"^\{(?:cmd|inp):", flags=re.IGNORECASE)
+# The `. ` prompt may be followed by a literal space, the end of the span, or
+# another SMCL directive -- base/l/levelsof.sthlp writes `{cmd:.{space 8}di ...}`,
+# where the prompt is present but spaced with {space 8} rather than a blank.
+_MARKED_PROMPT_RE = re.compile(r"^\{(?:cmd|inp):\s*\.(?=$|\s|\}|\{)", flags=re.IGNORECASE)
+
+
+# Characters that cannot begin a Stata command, so a line opening with one
+# can only be the continuation of the line above.
+_NOT_A_COMMAND_START_RE = re.compile(r"^[(\[,=|&<>+`]")
+
+
+def break_continues_paragraph(raw):
+    """Does this authored line continue its command on the next display line?
+
+    GATE 2 R20B. SMCL authors write one long command across several physical
+    lines by ending each but the last with `{break}`, closing the paragraph
+    with `{p_end}` only on the last:
+
+        {phang2}{cmd:. sem (Affective -> a1 a2 a3 a4 a5)}{break}
+                {cmd:(Cognitive -> c1 c2 c3 c4 c5)}{p_end}
+
+    `{break}` breaks the DISPLAY line. It does not close the paragraph and it
+    is not a command terminator, so both lines are one authored command. The
+    shape occurs 284 times across 83 unrelated installed help files, so this is
+    a general SMCL rule and not a `sem` repair; see
+    validation/gate2_reference_addendum_R20A_R20E.md.
+    """
+    s = str(raw)
+
+    if _P_END_RE.search(s):
+        return False
+
+    return bool(_BREAK_TAIL_RE.search(s))
+
+
+def marked_fragment_without_prompt(raw):
+    """A {cmd:...} fragment that continues, rather than starts, a command.
+
+    Two independent conditions must hold, and both are the author's own.
+
+    First, GATE 2 R08 fixes the `. ` prompt as the marker that a new command
+    begins: frames_intro.sthlp writes `{cmd:. frames dir}{break}` then
+    `{cmd:. frame dir}`, which are two commands. A prompt therefore disqualifies
+    the line immediately.
+
+    Second, the absence of a prompt is NOT by itself evidence of continuation,
+    because some authors use no prompts at all -- iesave.sthlp writes
+    `{inp:sysuse auto, clear}{break}` then `{inp:local myfolder ...}`, which are
+    separate commands. Measuring every `{break}`-continued fragment in both
+    authoritative roots gives 39 prompted, 161 beginning with an ordinary word,
+    and 91 beginning with a character that cannot start a Stata command at all
+    (`(` 79, `[` 6, `,` 2, a backtick 2, `=` 2).
+
+    Only that last group is joined. A fragment opening with `(`, `[`, `,`, `=`,
+    an operator or a backtick cannot be a command, so treating it as the
+    continuation of the line above is the only reading available -- no guess is
+    involved. The 161 word-initial fragments stay ambiguous and are left alone,
+    which is what R20B requires: reconstruct what a general rule justifies and
+    refuse to guess the rest.
+    """
+    stripped = _PARAGRAPH_TAG_RE.sub("", str(raw)).strip()
+
+    if not _MARKED_FRAGMENT_RE.match(stripped):
+        return False
+
+    if _MARKED_PROMPT_RE.match(stripped):
+        return False
+
+    visible = render(raw).strip()
+
+    return bool(visible) and _NOT_A_COMMAND_START_RE.match(visible) is not None
+
+
 class CommandList(list):
     """Reconstructed commands, plus whether they end inside an open block."""
 
-    __slots__ = ("open_block",)
+    __slots__ = ("open_block", "last_command_line")
 
     def __init__(self, items=()):
         super().__init__(items)
         self.open_block = None
+        # Source line of the final executable command, which is where the Run
+        # control belongs. None means it could not be determined.
+        self.last_command_line = None
 
 
 def reconstruct_unit(path, unit, roots):
@@ -2026,6 +2409,17 @@ def reconstruct_unit(path, unit, roots):
     comment_join_pending = False
     alternative_pending = False
     para_start = True
+    break_pending = False
+
+    # The Run control must be inserted immediately after the FINAL
+    # EXECUTABLE COMMAND of the example, never at the unit's structural
+    # end: a trailing non-runnable section -- a video list, a notes or
+    # references block, a native-link collection, plain prose -- lies
+    # inside the unit range but after the last thing that runs, and a
+    # control placed beyond it appears to belong to that section instead.
+    # None means no line contributed a command, which is a refusal, not a
+    # default to the end of the range.
+    last_command_line = None
 
     def flush_current():
         nonlocal current
@@ -2041,6 +2435,7 @@ def reconstruct_unit(path, unit, roots):
         raw = lines[line_no - 1]
         here_para_start = para_start
         para_start = next_paragraph_start(raw, para_start)
+        here_break = break_pending
 
         if hidden(raw):
             continue
@@ -2049,6 +2444,8 @@ def reconstruct_unit(path, unit, roots):
 
         if not visible:
             continue
+
+        break_pending = break_continues_paragraph(raw)
 
         stripped = strip_prompt(visible)
         low = stripped.lower()
@@ -2099,6 +2496,7 @@ def reconstruct_unit(path, unit, roots):
         if visible.lstrip().startswith("> ") and block_mode is None:
             if current is not None:
                 current = norm(current + " " + stripped)
+                last_command_line = line_no
                 continue
             if commands and not comment_join_pending:
                 commands[-1] = norm(commands[-1] + " " + stripped)
@@ -2125,6 +2523,7 @@ def reconstruct_unit(path, unit, roots):
         ):
             flush_current()
             commands.append(stripped)
+            last_command_line = line_no
             comment_join_pending = has_line_join(visible)
             continue
 
@@ -2147,6 +2546,7 @@ def reconstruct_unit(path, unit, roots):
 
             for command in link_commands:
                 commands.append(command)
+                last_command_line = line_no
                 cmd_low = command.lower()
 
                 if block_mode is not None:
@@ -2201,6 +2601,7 @@ def reconstruct_unit(path, unit, roots):
 
             if payload:
                 commands.append(payload)
+                last_command_line = line_no
 
             if payload.lower() == "end":
                 block_mode = None
@@ -2243,6 +2644,7 @@ def reconstruct_unit(path, unit, roots):
         ):
             flush_current()
             commands.append(stripped)
+            last_command_line = line_no
 
             if is_mata_start:
                 block_mode = "mata"
@@ -2261,6 +2663,7 @@ def reconstruct_unit(path, unit, roots):
         if visible.startswith(". "):
             flush_current()
             current = stripped
+            last_command_line = line_no
             continue
 
         if current is not None:
@@ -2284,13 +2687,44 @@ def reconstruct_unit(path, unit, roots):
                     + " "
                     + stripped
                 )
+                last_command_line = line_no
+                continue
+
+            elif here_break and marked_fragment_without_prompt(raw):
+                # GATE 2 R20B: the previous authored line closed with {break}
+                # inside a still-open paragraph and this line is the author's
+                # own marked fragment carrying no `. ` prompt, so the two
+                # display lines are one authored command.
+                current = current.rstrip() + " " + stripped
+                last_command_line = line_no
                 continue
 
             else:
                 flush_current()
 
-        if plausible_indented(raw, visible) or line_is_marked_command(
-            raw, here_para_start
+        # GATE 2 R20B, complementary half. `{break}` is an explicit authored
+        # display break, so the line after one begins a fresh display line and
+        # may carry the author's own marked command. Without this the second
+        # and later fragments of a {break}-broken paragraph are dropped
+        # outright: iesave.sthlp writes four authored commands per Example and
+        # only `sysuse auto, clear` survived, so a click would have run a
+        # fraction of the Example and reported SUCCESS.
+        #
+        # Two guards keep the relaxation from reopening anything. The break
+        # must be the author's own -- wrapped prose has none, it simply runs on
+        # -- and no block may be open, because inside program/input/Mata bodies
+        # the body-capture path already owns every line and must not be
+        # second-guessed. prose_continuation() still guards the line itself.
+        break_line_command = (
+            here_break
+            and block_mode is None
+            and line_is_marked_command(raw, True)
+        )
+
+        if (
+            plausible_indented(raw, visible)
+            or line_is_marked_command(raw, here_para_start)
+            or break_line_command
         ):
             if (
                 visible_example_heading(raw)
@@ -2299,6 +2733,7 @@ def reconstruct_unit(path, unit, roots):
                 continue
 
             current = stripped
+            last_command_line = line_no
 
     flush_current()
 
@@ -2330,6 +2765,7 @@ def reconstruct_unit(path, unit, roots):
     # way. The unit is therefore returned, carrying the open block, and
     # click_run refuses with a frozen reason if it is ever clicked.
     normalized.open_block = block_mode
+    normalized.last_command_line = last_command_line
 
     # Preserve authored command order exactly.  Repeated commands are
     # semantically meaningful in many help examples (for example repeated
@@ -3028,6 +3464,61 @@ def unit_loads_data(unit):
     return False
 
 
+DATA_GENERATING_RE = re.compile(
+    r"^(set\s+obs|input\b|drawnorm|generate|gen|egen|matrix\s+\w+\s*=)\b",
+    flags=re.IGNORECASE,
+)
+
+USER_DATA_INSTRUCTION_RE = re.compile(
+    r"\b(your\s+(own\s+)?data|use\s+your|substitute\s+your|"
+    r"replace\s+.*with\s+your)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def example_provides_data_setup(unit, doc_lines=()):
+    """Does this structural Example supply anything to run against?
+
+    Section 9's EXAMPLE_DATA_SETUP_MISSING requires source-side evidence that
+    the Example provides no dataset, no data-generating setup, no package/cwd/
+    URL data source and no legitimate user-data instruction. Without that
+    evidence an arbitrary r(111) must NOT be remapped to this reason -- that is
+    the negative control the frozen mutant M39 exists to enforce.
+
+    This is a structural audit of the authored source. No help topic, package
+    or command name takes part in the decision.
+    """
+    for command in unit.get("code", []):
+        s = command.strip()
+
+        if DATA_LOAD_RE.match(s):
+            return True
+        if DATA_GENERATING_RE.match(s):
+            return True
+        # A download that stages a dataset is a data source.
+        if re.match(r"^copy\s+\S+", s, flags=re.IGNORECASE) and re.search(
+            r"\.(dta|csv|xlsx?|txt)\b", s, flags=re.IGNORECASE
+        ):
+            return True
+        # An explicit frame/preserve of existing data still needs a source, so
+        # those alone do not count.
+
+    # A help page that tells the reader to bring their own data is not a
+    # missing-setup defect; it is USER_DATA_REQUIRED and is handled elsewhere.
+    for line in doc_lines or ():
+        if USER_DATA_INSTRUCTION_RE.search(str(line)):
+            return True
+
+    return False
+
+
+NO_DATA_PHRASES = (
+    "no variables defined",
+    "no observations",
+    "data in memory would be lost",
+)
+
+
 def unit_data_source(unit):
     """The dataset a unit loads, as (kind, name), or (None, None)."""
     for command in unit["code"]:
@@ -3420,6 +3911,156 @@ def _package_provenance(token, ctx):
     return None
 
 
+# The package a persistent-install command would install. General across the
+# install forms Stata actually offers; it names no package.
+_INSTALL_TARGET_RE = re.compile(
+    r"^\s*(?:ssc\s+(?:install|hot)|net\s+(?:install|get))\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)",
+    flags=re.IGNORECASE,
+)
+
+
+def dependency_already_usable(command, ctx):
+    """Is the dependency this install command provides already available?
+
+    Specification U-R13: an already-usable dependency must not be reinstalled,
+    and no confirmation may be requested merely because an install command
+    appears in the Example. R20E separates already-usable from declined,
+    approved-but-unverified and approved-verified; only the last resumes.
+
+    Usability is decided by the same authoritative resolution helprun uses
+    everywhere else, which inside Stata is Stata's own `findfile`. That keeps
+    the answer identical to the one the child process would get, and keeps this
+    rule free of any package name.
+    """
+    match = _INSTALL_TARGET_RE.match(command.strip())
+
+    if not match:
+        return None
+
+    name = match.group(1)
+    roots = ctx.get("roots") or []
+
+    for ext in (".ado", ".sthlp"):
+        found = resolve_source_file(name + ext, roots)
+        if found is not None and Path(found).exists():
+            return name
+
+    return None
+
+
+# ============================================================
+# PERSISTENT DEPENDENCY WORKFLOW  (specification section 7.3, GATE 2 R20E)
+# ============================================================
+#
+# R20E established by controlled observation that the four states are
+# distinguishable without guessing:
+#
+#   already usable            findfile/which succeed BEFORE any install
+#   missing                   findfile fails; an install would be required
+#   approved but unverified   the install returns, yet the dependency is still
+#                             unresolvable, so nothing became usable
+#   approved and verified     the dependency resolves after the install
+#
+# Only the last may resume the clicked Example. The decision is a pure function
+# so it can be exercised without installing anything: the caller injects how a
+# dependency is looked up and how an install is performed. Production passes the
+# real Stata-backed probes; tests pass controlled ones and never touch the
+# user's installation.
+
+DEP_ALREADY_USABLE = "ALREADY_USABLE"
+DEP_MISSING = "MISSING"
+DEP_DECLINED = "DECLINED"
+DEP_APPROVED_UNVERIFIED = "APPROVED_UNVERIFIED"
+DEP_APPROVED_VERIFIED = "APPROVED_VERIFIED"
+
+DEP_ACTION_SKIP = "SKIP"
+DEP_ACTION_CONFIRM = "CONFIRM"
+DEP_ACTION_STOP = "STOP"
+DEP_ACTION_FAIL = "FAIL"
+DEP_ACTION_RESUME = "RESUME"
+
+
+def dependency_workflow(command, ctx, approved=None,
+                        is_usable=None, do_install=None):
+    """One persistent-install command, resolved to a state and an action.
+
+    `approved` is None until the user has been asked: the workflow then returns
+    CONFIRM and stops, which is what makes the confirmation a real boundary
+    rather than something inferred. True or False carry the user's actual answer.
+
+    `is_usable(name)` and `do_install(command)` are injected so the state
+    machine can be tested exhaustively without performing a persistent change.
+    Production supplies the authoritative Stata-backed versions.
+    """
+    if is_usable is None:
+        def is_usable(name):
+            return dependency_already_usable("ssc install " + name, ctx) is not None
+
+    match = _INSTALL_TARGET_RE.match(command.strip())
+    name = match.group(1) if match else ""
+
+    if not name:
+        return {"state": "", "action": "", "package": "", "resume": False}
+
+    def result(state, action, resume=False, evidence=""):
+        return {
+            "state": state,
+            "action": action,
+            "package": name,
+            "resume": resume,
+            "command": command.strip(),
+            "evidence": evidence,
+        }
+
+    # 1. Already usable: nothing to install and nothing to ask.
+    if is_usable(name):
+        return result(DEP_ALREADY_USABLE, DEP_ACTION_SKIP,
+                      evidence=name + " is already available")
+
+    # 2. Missing and not yet answered: the user must be asked, and the exact
+    #    bounded change is what they are asked about.
+    if approved is None:
+        return result(DEP_MISSING, DEP_ACTION_CONFIRM,
+                      evidence="would install " + name)
+
+    # 3. Declined: stop cleanly, without executing the Example.
+    if not approved:
+        return result(DEP_DECLINED, DEP_ACTION_STOP,
+                      evidence="user declined the persistent change")
+
+    # 4. Approved: perform only the approved operation, then VERIFY. R20E state
+    #    3 showed an install can return and still leave the dependency
+    #    unusable, so a returned install is never taken as success.
+    if do_install is not None:
+        do_install(command)
+
+    if not is_usable(name):
+        return result(DEP_APPROVED_UNVERIFIED, DEP_ACTION_FAIL,
+                      evidence=name + " is still unusable after the install")
+
+    return result(DEP_APPROVED_VERIFIED, DEP_ACTION_RESUME, resume=True,
+                  evidence=name + " verified usable")
+
+
+def resume_plan(commands, completed):
+    """The commands still to run after an approved, verified install.
+
+    Section 7.3 forbids duplicating already completed authored commands. The
+    confirmation happens before any authored command executes, so `completed`
+    is normally empty and the whole plan resumes; the parameter exists so a
+    partial run can never be replayed from the top.
+    """
+    done = list(completed or [])
+    remaining = list(commands)
+
+    for finished in done:
+        if remaining and remaining[0] == finished:
+            remaining.pop(0)
+
+    return remaining
+
+
 def guard_decision(command, ctx):
     """Classify one reconstructed command by role, provenance and target."""
     s = command.strip()
@@ -3434,6 +4075,8 @@ def guard_decision(command, ctx):
         "fallback_available": False,
         "provenance": "",
         "evidence": "",
+        # A command the plan must not execute, though nothing is wrong with it.
+        "skip": False,
     }
 
     if not s or s.startswith("*") or s.startswith("//"):
@@ -3441,6 +4084,24 @@ def guard_decision(command, ctx):
 
     if DATA_LOAD_RE.match(s):
         decision["dependency_class"] = DEP_DATA_SETUP
+
+    # An install whose dependency is already usable is neither a persistent
+    # change nor a question for the user: there is nothing to install. Running
+    # it anyway would reinstall over a working copy, which is exactly the
+    # persistent modification the confirmation exists to prevent, so the
+    # command is skipped rather than allowed through.
+    already = dependency_already_usable(s, ctx) if PERSISTENT_INSTALL_RE.match(s) else None
+
+    if already:
+        decision.update(
+            decision=GUARD_ALLOW,
+            dependency_class=DEP_EXPLICIT_RUNTIME,
+            role="dependency_already_usable",
+            skip=True,
+            provenance="resolved",
+            evidence="%s is already available; nothing is installed" % already,
+        )
+        return decision
 
     # Persistent installation or configuration always needs confirmation.
     if PERSISTENT_INSTALL_RE.match(s):
@@ -3872,8 +4533,14 @@ NETWORK_FAILURE_PHRASES = (
 )
 
 
-def classify_child_failure(log_text, r_codes, known_missing_vars=None):
-    """Map a child failure to (reason, evidence line) from real evidence."""
+def classify_child_failure(log_text, r_codes, known_missing_vars=None,
+                           no_data_setup=False):
+    """Map a child failure to (reason, evidence line) from real evidence.
+
+    `no_data_setup` is the SOURCE-side finding from example_provides_data_setup().
+    It is required, not optional: an arbitrary r(111) must never be rewritten as
+    EXAMPLE_DATA_SETUP_MISSING without it.
+    """
     text = log_text or ""
     low = text.lower()
 
@@ -3916,6 +4583,16 @@ def classify_child_failure(log_text, r_codes, known_missing_vars=None):
     if code == "111":
         if known_missing_vars:
             return "HELP_DATA_MISMATCH", evidence
+
+        # Section 9: a data-dependent Example that supplies no dataset, no
+        # data-generating setup, no package/cwd/URL source and no user-data
+        # instruction, whose child really did hit the no-data condition, is
+        # EXAMPLE_DATA_SETUP_MISSING. Both halves are required -- the runtime
+        # no-data result AND the source-side absence of setup -- so an
+        # unrelated r(111) is never remapped.
+        if no_data_setup and any(p in low for p in NO_DATA_PHRASES):
+            return "EXAMPLE_DATA_SETUP_MISSING", evidence
+
         return "AMBIGUOUS_FAILURE_PROVENANCE", evidence
 
     return "AMBIGUOUS_FAILURE_PROVENANCE", evidence
@@ -4221,24 +4898,156 @@ def graph_capture_postamble(out_dir, basename, order_macro="HR_GORDER"):
     ]
 
 
+# Markers that fence the authored region of the child plan. Section 12.1A
+# requires parent Results to show the authored commands and their ordinary
+# Stata results ONCE, with no internal framing or instrumentation. Rather than
+# trying to recognise instrumentation by its text -- which would drift the
+# moment the instrumentation changed -- the plan states plainly where the
+# authored region starts and stops, and the Results transcript keeps only that.
+AUTHORED_BEGIN = "HELPRUN-AUTHORED-BEGIN"
+AUTHORED_END = "HELPRUN-AUTHORED-END"
+GSNAP_CALL = "capture _hr_gsnap"
+
+
 def build_child_plan(commands, capture):
     """Interleave read-only capture instrumentation into one child plan."""
     if not capture:
-        return list(commands)
+        return (["* " + AUTHORED_BEGIN]
+                + list(commands)
+                + ["* " + AUTHORED_END])
 
     out = list(graph_capture_preamble())
     flags = top_level_flags(commands)
 
+    out.append("* " + AUTHORED_BEGIN)
+
     for command, safe in zip(commands, flags):
         out.append(command)
         if safe:
-            out.append("capture _hr_gsnap")
+            out.append(GSNAP_CALL)
+
+    out.append("* " + AUTHORED_END)
 
     out.extend(
         graph_capture_postamble(capture["out_dir"], capture["basename"])
     )
 
     return out
+
+
+# Stata's own batch epilogue, which follows the authored region when a
+# child aborts. Anchored, so an authored command that merely mentions the
+# phrase cannot truncate the transcript.
+_BATCH_EPILOGUE_RE = re.compile(r'^(?:end of do-file|r\([0-9]+\);)$')
+
+
+def results_transcript(child_log):
+    """The authored region of a child log, fit for parent Results.
+
+    Section 12.1A: ordinary Results must resemble normal interactive Stata. It
+    must never carry the Stata batch banner, the run-log header, helprun's
+    graph-capture instrumentation, or duplicate streams. Everything stripped
+    here is still preserved in full in the persistent log.
+    """
+    if not child_log:
+        return ""
+
+    lines = child_log.splitlines()
+
+    start = None
+    stop = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if AUTHORED_BEGIN in stripped:
+            start = i + 1
+        elif AUTHORED_END in stripped:
+            stop = i
+            break
+
+    if start is None:
+        # No marker: the child died before reaching the authored region, so
+        # there is no ordinary transcript to show. The caller falls back to the
+        # concise causal diagnostic.
+        return ""
+
+    if stop is None:
+        # The child failed, so it never reached the closing marker and the
+        # slice would otherwise run on into Stata's batch epilogue.
+        # Everything after the authored region is batch scaffolding: the
+        # `end of do-file` line and the final `r(NNN);`. Section 12.1A forbids
+        # both from ordinary Results, and the ado prints the causal message and
+        # its code itself, so leaving them would also duplicate the code.
+        stop = len(lines)
+        for i in range(start, len(lines)):
+            if _BATCH_EPILOGUE_RE.match(lines[i].strip()):
+                stop = i
+                break
+
+    body = lines[start:stop]
+
+    out = []
+    for line in body:
+        stripped = line.strip()
+        if stripped == "." or stripped == "":
+            out.append("")
+            continue
+        # Drop the echo of the per-command capture hook and of the markers.
+        if stripped in (". " + GSNAP_CALL, GSNAP_CALL):
+            continue
+        if AUTHORED_BEGIN in stripped or AUTHORED_END in stripped:
+            continue
+        out.append(line)
+
+    # Collapse the blank runs that removing instrumentation leaves behind.
+    cleaned = []
+    for line in out:
+        if line == "" and cleaned and cleaned[-1] == "":
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned).strip("\n")
+
+
+STATA_NOISE = (
+    "end of do-file",
+    "r(0);",
+)
+
+
+def causal_stata_error(child_log):
+    """The meaningful Stata error, not merely `end of do-file`.
+
+    Stata prints the human-readable message immediately before its `r(NNN);`
+    line. Section 12.1A requires Results to show that causal message and code.
+    """
+    if not child_log:
+        return "", ""
+
+    lines = [l.rstrip() for l in child_log.splitlines()]
+
+    for i in range(len(lines) - 1, -1, -1):
+        m = re.match(r"^r\((\d+)\);\s*$", lines[i].strip())
+        if not m:
+            continue
+
+        code = m.group(1)
+
+        # Walk back to the nearest non-empty, non-echo, non-noise line.
+        for j in range(i - 1, max(-1, i - 12), -1):
+            candidate = lines[j].strip()
+            if not candidate:
+                continue
+            if candidate.startswith(". ") or candidate.startswith("> "):
+                continue
+            if candidate in STATA_NOISE:
+                continue
+            if re.match(r"^r\(\d+\);$", candidate):
+                continue
+            return candidate, code
+
+        return "", code
+
+    return "", ""
 
 
 # ============================================================
@@ -4301,7 +5110,7 @@ def collect_authored_artifacts(sandbox, pre_existing):
 # type, and it is never documented as public API.
 # ============================================================
 
-HELPRUN_VERSION = "2.0.0"
+HELPRUN_VERSION = "1.0.0"
 
 
 class UnitList(list):
@@ -4342,6 +5151,13 @@ def runnable_units_for(source, roots):
         # Carried so click_run can refuse a unit that ends inside an open
         # block, without that refusal costing the unit its place on the page.
         unit["open_block"] = getattr(code, "open_block", None)
+        # Where the Run control belongs: immediately after the example's final
+        # executable command, not at the unit's structural end. A trailing
+        # non-runnable section -- video list, notes, references, a native-link
+        # collection, plain prose -- sits inside the range but after everything
+        # that runs, and a control placed past it reads as belonging to that
+        # section rather than to the example.
+        unit["last_command_line"] = getattr(code, "last_command_line", None)
         units.append(unit)
 
     for index, unit in enumerate(units, start=1):
@@ -4426,10 +5242,16 @@ def resolve_topic_document(topic, stata_roots=None):
     }
 
 
-def _run_link_line(token):
+def _run_link_line(handle):
+    """The Viewer's Run control.
+
+    Stata echoes a clicked {stata ...} link verbatim, so whatever this line
+    contains is what the user sees in Results. It therefore carries a short
+    content-addressed handle, not the identity payload itself.
+    """
     return (
         "{p 8 8 2}({stata helprun, hrclick("
-        + token
+        + handle
         + "):Run this example}){p_end}"
     )
 
@@ -4457,10 +5279,47 @@ def prepare_clickable(stata_roots=None, topic_override=None):
 
     insertion_after = {}
 
+    # The identity payload is filed in the private click registry and the link
+    # carries only its content-addressed handle, so a click echoes a short
+    # readable command instead of a 200-character token.
+    prune_click_registry()
+
+    unplaceable = []
+
     for unit in units:
+        # The control is anchored to the last executable command. If that line
+        # is unknown, or falls outside the unit, the placement is ambiguous and
+        # the specification requires OMITTING the control and recording the
+        # example as unresolved -- never guessing a position.
+        anchor_line = unit.get("last_command_line")
+
+        # The control must also fall BEFORE any subsequent structural section.
+        # A trailing video list, notes, references or native-link collection can
+        # sit inside the unit range; a control placed past one reads as
+        # belonging to that section rather than to the example. Clamping to the
+        # first such boundary is a general rule about document structure and
+        # names no topic.
+        boundary = None
+        for probe in range(unit["start"] + 1, unit["end"] + 1):
+            if peer_structural_boundary(lines[probe - 1]):
+                boundary = probe
+                break
+
+        if boundary is not None and anchor_line is not None                 and anchor_line >= boundary:
+            anchor_line = None
+
+        if (anchor_line is None
+                or not (unit["start"] <= anchor_line <= unit["end"])):
+            unplaceable.append({
+                "ordinal": unit.get("ordinal"),
+                "heading": unit.get("heading", ""),
+                "reason": "AMBIGUOUS_RUN_CONTROL_PLACEMENT",
+            })
+            continue
+
         identity = build_click_identity(topic, doc["source"], graph, unit)
-        token = encode_click_identity(identity)
-        insertion_after.setdefault(unit["end"], []).append(token)
+        handle = store_click_identity(identity)
+        insertion_after.setdefault(anchor_line, []).append(handle)
 
     out = []
     link_count = 0
@@ -4470,11 +5329,11 @@ def prepare_clickable(stata_roots=None, topic_override=None):
         # native {stata ...} links untouched.
         out.append(str(raw))
 
-        for token in insertion_after.get(line_no, []):
-            out.extend(["", _run_link_line(token), ""])
+        for handle in insertion_after.get(line_no, []):
+            out.extend(["", _run_link_line(handle), ""])
             link_count += 1
 
-    if link_count != len(units):
+    if link_count != len(units) - len(unplaceable):
         raise HelprunError(
             "HELPRUN_INTERNAL_ERROR",
             "helprun: click-link generation did not match the example count",
@@ -4564,16 +5423,32 @@ def _log_header(identity, target, plan, extra=()):
 
 
 def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
-    """Execute exactly the example the user clicked."""
+    """Execute exactly the example the user clicked.
+
+    `token` is the short content-addressed handle the Viewer's Run control
+    carries. The identity payload it names is recovered from the private click
+    registry and proved unaltered before anything else happens; the payload is
+    then the same structure it has always been, and every downstream check --
+    source-graph rebuild, aggregate-hash comparison, exact unit binding -- is
+    unchanged.
+    """
     cleanup_stale_views()
 
-    identity = decode_click_identity(token)
+    identity = decode_click_identity(load_click_identity(token))
 
     exe = stata_exe()
     roots = ado_roots(exe, stata_roots)
 
-    out_dir = Path(parent_pwd) if parent_pwd else Path.cwd()
-    writable = output_directory_writable(out_dir)
+    # Frozen section 12.1: every artifact of this click goes in one directory
+    # named for the ROOT help topic, beneath the click-time c(pwd).
+    parent_root = Path(parent_pwd) if parent_pwd else Path.cwd()
+    out_dir = ensure_topic_directory(parent_root, str(identity.get("topic", "")))
+    writable = out_dir is not None
+
+    if out_dir is None:
+        # Nothing may be written, but the caller still needs a location to
+        # report, so name the directory that could not be created.
+        out_dir = topic_output_directory(parent_root, str(identity.get("topic", "")))
 
     basename = ""
     target = None
@@ -4755,7 +5630,17 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
             )
 
         # Runtime and safety policy, by role and provenance.
-        _decisions, blocking = guard_plan(commands, ctx)
+        decisions, blocking = guard_plan(commands, ctx)
+
+        # A command the guard marked skippable is replaced by an inert comment
+        # rather than dropped, so the authored order and every later index stay
+        # exactly as reconstructed. U-R13: an already-usable dependency must not
+        # be reinstalled, so the install must not reach the child at all.
+        if any(d.get("skip") for d in decisions):
+            commands = [
+                ("* helprun: skipped, " + d["evidence"]) if d.get("skip") else c
+                for c, d in zip(commands, decisions)
+            ]
 
         if blocking:
             first = blocking[0]
@@ -4835,14 +5720,31 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
                     or "helprun: the example could not be run",
                 )
             else:
+                no_setup = not example_provides_data_setup(
+                    target or {}, getattr(graph, "lines", ())
+                )
+
                 reason, evidence = classify_child_failure(
-                    child_log, result.get("r_codes") or []
+                    child_log,
+                    result.get("r_codes") or [],
+                    no_data_setup=no_setup,
                 )
-                error = HelprunError(
-                    reason,
-                    "helprun: the example did not run to completion. "
-                    + (evidence or "See the log for the Stata error."),
-                )
+
+                if reason == "EXAMPLE_DATA_SETUP_MISSING":
+                    # Section 9 fixes the exact concise public wording. The
+                    # literal Stata error, the commands and the internal
+                    # classification stay in the persistent log.
+                    message = (
+                        "helprun: this example does not provide a runnable "
+                        "dataset or data setup."
+                    )
+                else:
+                    message = (
+                        "helprun: the example did not run to completion. "
+                        + (evidence or "See the log for the Stata error.")
+                    )
+
+                error = HelprunError(reason, message)
 
             outcome = refuse(
                 error,
@@ -5000,8 +5902,59 @@ def ado_prepare(roots):
 
 
 def ado_click(token, parent_pwd, roots):
-    """Single entry point for helprun.ado's click call."""
-    return _flatten_for_ado(run_public(token, parent_pwd, roots))
+    """Single entry point for helprun.ado's click call.
+
+    Section 12.1A shapes what the parent Results window may contain. This is
+    where the outcome is turned into exactly two things the ado can show:
+
+      resultsfile  the authored commands and their ordinary Stata output, once,
+                   with the batch banner, the run-log header and helprun's own
+                   graph instrumentation removed
+      location     the single concise absolute directory line
+
+    Everything else -- the literal child transcript, provenance, hashes,
+    internal classification and the artifact manifest -- stays in the
+    persistent log and never reaches Results.
+    """
+    outcome = run_public(token, parent_pwd, roots)
+
+    transcript = results_transcript(outcome.get("child_output", ""))
+
+    # On failure, prefer the meaningful causal Stata message over the
+    # `end of do-file` noise the batch log ends with.
+    causal, code = causal_stata_error(outcome.get("child_output", ""))
+    outcome["causal"] = causal
+    outcome["rcode"] = code
+
+    results_path = ""
+    if transcript:
+        try:
+            handle, tmp = tempfile.mkstemp(prefix="helprun_results_", suffix=".txt")
+            os.close(handle)
+            Path(tmp).write_text(transcript + "\n", encoding="utf-8")
+            results_path = tmp
+        except OSError:
+            results_path = ""
+
+    outcome["resultsfile"] = results_path
+
+    # One concise location line, using the actual absolute topic directory.
+    out_dir = str(outcome.get("output_dir", "") or "")
+    location = ""
+    if out_dir:
+        shown = out_dir if out_dir.endswith(("\\", "/")) else out_dir + "\\"
+        if outcome.get("status") == STATUS_SUCCESS:
+            # The destination holds the run log plus any graphs and
+            # authored artifacts, so the line names what is actually there.
+            location = "helprun: log and other output files saved in " + shown
+        elif outcome.get("logfile"):
+            location = "helprun: diagnostic log saved in " + shown
+    outcome["location"] = location
+
+    # The raw child transcript must not travel through a Stata macro.
+    outcome.pop("child_output", None)
+
+    return _flatten_for_ado(outcome)
 
 
 def run_public(token, parent_pwd=None, stata_roots=None):
