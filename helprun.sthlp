@@ -36,30 +36,30 @@ Results prints one line naming that directory:{p_end}
 {title:Why use helprun?}
 
 {pstd}
-Help examples are written to be read, not to be run. To try one you normally
-have to select the right lines, strip the leading dots and continuation
-markers, notice that the example depends on a dataset loaded three paragraphs
-earlier, paste the result somewhere, and hope you did not disturb the data you
-already had open.{p_end}
-
-{pstd}
-{cmd:helprun} removes that work. It reads the example as the author wrote it,
-adds only the earlier setup that example actually needs, and runs the whole
-thing in one step. When an example cannot run, it tells you plainly why
-instead of failing in a way you have to diagnose yourself.{p_end}
+A Stata help example may contain setup code, data-loading steps, multiline
+commands, loops, links, or code spread across help content. {cmd:helprun}
+reconstructs the complete example for you, runs it only after you click
+{bf:Run this example}, returns the result to Stata, and reports a clear
+reason when the example cannot be reproduced as written.{p_end}
 
 {title:Key features}
 
-{p 4 8 2}• {bf:One click, whole example.} Run a complete structural example straight from
-the Viewer, with no copying, no editing and no example number to type.{p_end}
+{p 4 8 2}• {bf:One-click complete examples.} Run a complete example directly
+from the Viewer across official Stata help and installed user-written help,
+without copying code into the Do-file Editor.{p_end}
 
-{p 4 8 2}• {bf:Reads real help files.} Reconstructs examples conservatively
-across the formats Stata help actually uses, including continuation lines,
-blocks, native clickable command links, and setup written earlier in the page.{p_end}
+{p 4 8 2}• {bf:Protected execution with clear diagnostics.} Run examples
+outside the interactive parent session; when required data, runtime
+components, or other prerequisites are unavailable, {cmd:helprun} explains
+what prevented the run instead of substituting or guessing.{p_end}
 
-{p 4 8 2}• {bf:Isolated and saved.} Runs in a hidden Stata that cannot touch
-your session, preserves the log, graphs and authored output, and reports a
-clear, evidence-based reason when an example cannot run.{p_end}
+{p 4 8 2}• {bf:Automatic output preservation.} Return run output to Results
+and save {it:topic}-example-{it:N}.log in the working directory current when
+the example is clicked. Capturable Stata graphs are preserved as .gph and
+.png; clearly authored final outputs can include .dta, .csv, .xlsx, .docx,
+.pdf, .tex, .html, and .svg. Existing files are not overwritten; when needed,
+{cmd:-run-2}, {cmd:-run-3}, and later suffixes are used for the saved
+run.{p_end}
 
 {title:Syntax}
 
@@ -134,18 +134,21 @@ failure of the help file or of your setup.{p_end}
 {title:Compatibility}
 
 {pstd}
-{cmd:helprun} runs each example in a hidden Stata so your session is
-protected, but it is {bf:not} a malware sandbox and it makes no security
-guarantee about code an author wrote. Installing or downloading anything on your
-behalf is never done silently: whatever would change your Stata installation
-is described first and needs your confirmation.{p_end}
+{cmd:helprun} requires Stata 16 or later.{p_end}
 
 {pstd}
-{cmd:helprun} has been developed and tested on Windows 10 with StataNow 19.5
-and Stata's Python integration available ({cmd:python query}). Identifying the
-help Viewer belonging to your Stata session uses Windows facilities. Other
-platforms and other Stata versions are not validated, and no wider
-compatibility is claimed.{p_end}
+That requirement follows from Stata frames, which {cmd:helprun} uses and
+which were introduced in Stata 16. Release validation was carried out on
+Windows 10 with StataNow 19.5 and Stata's Python integration available
+({cmd:python query}). Stata 16 through 18 are supported but were not part of
+that validation, and other platforms are not validated.{p_end}
+
+{pstd}
+Each example runs in a separate hidden Stata, so your session is protected,
+but {cmd:helprun} is {bf:not} a malware sandbox and makes no security
+guarantee about code an author wrote. Installing or downloading anything on
+your behalf is never done silently: whatever would change your Stata
+installation is described first and needs your confirmation.{p_end}
 
 {title:Version}
 
@@ -159,6 +162,18 @@ Hao Ma, PhD{p_end}
 
 {pstd}
 Email: {browse "mailto:shouhuoxiwang2027@gmail.com":shouhuoxiwang2027@gmail.com}{p_end}
+
+{title:Suggested citation}
+
+{pstd}
+If you use {cmd:helprun} in research, please cite the software as: Ma, H.
+(2026). helprun: Run complete Stata help examples with a single click in the
+Viewer. Version 1.0.0. Available at
+{browse "https://github.com/Louis8102/helprun":https://github.com/Louis8102/helprun}.{p_end}
+
+{pstd}
+The SSC component identifier will be added to this citation once it has been
+officially assigned.{p_end}
 
 {title:License}
 

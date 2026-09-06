@@ -277,6 +277,7 @@ REASON_CLASS = {
     "EXECUTION_TIMEOUT": CLASS_EXECUTION,
     "CROSS_PROCESS_STATE_DEPENDENCY": CLASS_EXECUTION,
     "USER_INTERACTION_REQUIRED": CLASS_EXECUTION,
+    "INTERACTIVE_INPUT_REQUIRED": CLASS_EXECUTION,
     "HELPRUN_BUSY": CLASS_EXECUTION,
     "AMBIGUOUS_FAILURE_PROVENANCE": CLASS_EXECUTION,
     # OUTPUT
@@ -1245,19 +1246,48 @@ def _matching_brace(s, start):
 
 def _split_link_body(body):
     """Split a link body into (args, display_text) on the first colon that is
-    at brace depth 0 and outside quotes.  display_text is None for syntax 3."""
-    depth = 0
-    in_quote = False
+    at brace depth 0 and outside ALL quoting.  display_text is None for
+    syntax 3.
 
-    for i, ch in enumerate(body):
+    Quoting follows Stata's own rules, because that is what the Viewer applies
+    when it runs the link: compound quotes `"..."' nest, and inside them a
+    simple " is literal text rather than a quote boundary. The earlier version
+    toggled one quote state on every ", so in `"... title("x") note("Data
+    source: auto.dta")"' the inner "..." pairs flipped the state back to
+    unquoted and the colon in "Data source:" was taken for the separator; the
+    command came back cut short with a dangling opener (HPROD-41, seen on real
+    pages). Quoting the command is precisely how an author protects an inner
+    colon, so the colon that separates is the first one outside every quote.
+    This is a rule about SMCL and Stata quoting; no topic takes part.
+    """
+    depth = 0
+    compound = 0
+    in_quote = False
+    i = 0
+    n = len(body)
+
+    while i < n:
+        ch = body[i]
+
         if ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
-        elif ch == '"' and depth == 0:
-            in_quote = not in_quote
-        elif ch == ":" and depth == 0 and not in_quote:
-            return body[:i], body[i + 1:]
+        elif depth == 0:
+            if body.startswith('`"', i):
+                compound += 1
+                i += 2
+                continue
+            if compound and body.startswith('"\'', i):
+                compound -= 1
+                i += 2
+                continue
+            if ch == '"' and compound == 0:
+                in_quote = not in_quote
+            elif ch == ":" and compound == 0 and not in_quote:
+                return body[:i], body[i + 1:]
+
+        i += 1
 
     return body, None
 
@@ -1430,7 +1460,43 @@ def prose_continuation(text):
     return bool(hits) and len(words) >= 3 and bare.rstrip().endswith((".", "?", "!"))
 
 
-def line_is_marked_command(raw, at_paragraph_start=True):
+def paragraph_visible_text(lines, index):
+    """Visible text of the SMCL paragraph beginning at `index`.
+
+    A paragraph is what an author writes as one sentence; the line breaks
+    inside it are wrapping, not structure. It ends at {p_end}, at a blank
+    line, or at the next paragraph or block directive.
+
+    This exists because judging a paragraph by its first physical line is what
+    manufactured a command out of a sentence. The real page wrote:
+
+        {pstd}
+        {cmd:neststatus, detail} reports 22 observations removed, nine variables
+        removed, and the checkpoint to be restored. {cmd:nestrestore} then ...
+
+    The first line alone carries one function word and no terminal stop, so it
+    read as a command continuation and was joined; the words that make it
+    unmistakably English -- "and", "to", "the", and the full stop -- were all
+    on the following line. Stata then rejected `invalid 'nine'`. Sentences are
+    not decided one line at a time.
+    """
+    out = []
+    for raw in lines[index:]:
+        stripped = raw.strip()
+        if not stripped:
+            break
+        out.append(render(raw))
+        if "{p_end}" in stripped:
+            break
+        if out and len(out) > 1 and re.match(
+                r"^\{(?:p |pstd|phang|pmore|title|p2col|synopt|hline|marker)",
+                stripped):
+            out.pop()
+            break
+    return " ".join(part for part in out if part)
+
+
+def line_is_marked_command(raw, at_paragraph_start=True, following_text=""):
     """Is this whole line an explicit {cmd:...} / {inp:...} command line?
 
     SMCL's {cmd} and {inp} directives are the author's own statement that the
@@ -1527,7 +1593,11 @@ def line_is_marked_command(raw, at_paragraph_start=True):
     # The author's marker says the OPENING token is a command name. It does not
     # say the rest of the paragraph is code, and real help constantly opens a
     # descriptive sentence with the command's own name in a {cmd:...} span.
-    if prose_continuation("".join(plain)):
+    #
+    # The whole paragraph is judged, not this line alone: wrapping decides
+    # where a sentence breaks, and a sentence broken mid-clause looks exactly
+    # like a command continuation until its next line arrives.
+    if prose_continuation("".join(plain) + " " + (following_text or "")):
         return False
 
     return True
@@ -2140,6 +2210,18 @@ def obvious_stata_output(raw, visible):
     if not s:
         return False
 
+    # Text the author marked as DISPLAYED OUTPUT is output whatever word it
+    # begins with. SMCL's {txt:...}, {res:...} and {err:...} (and the bare
+    # style switches {txt}, {res}, {err}) are Stata's own output styles -- what
+    # a log shows as text, result and error -- so a line whose paragraph
+    # content opens with one of them renders what a command printed; it is
+    # never a command. A help page that shows its expected output under the
+    # command lines writes exactly this, and an output line that happens to
+    # begin with the command word must not become a third command (HPROD-44).
+    content = _PARAGRAPH_TAG_RE.sub("", str(raw)).strip()
+    if re.match(r"^\{(?:txt|res|err|text|result|error)(?:[:}])", content, re.IGNORECASE):
+        return True
+
     # Horizontal/table separators commonly emitted by Stata.
     if re.match(
         r"^[+\-_=|.\s]+$",
@@ -2391,7 +2473,7 @@ def marked_fragment_without_prompt(raw):
 class CommandList(list):
     """Reconstructed commands, plus whether they end inside an open block."""
 
-    __slots__ = ("open_block", "last_command_line")
+    __slots__ = ("open_block", "last_command_line", "unreliable_fragments")
 
     def __init__(self, items=()):
         super().__init__(items)
@@ -2399,6 +2481,141 @@ class CommandList(list):
         # Source line of the final executable command, which is where the Run
         # control belongs. None means it could not be determined.
         self.last_command_line = None
+        # Fragments that could not be read as a command and that no open
+        # delimiter above them justified joining. Carried rather than executed:
+        # reconstructing an authored continuation is permitted, inventing a
+        # missing one is not.
+        self.unreliable_fragments = []
+
+
+_COMMAND_PREFIXES = frozenset({
+    "quietly", "qui", "noisily", "noi", "capture", "cap", "by", "bysort",
+    "sort", "version", "svy", "mi", "statsby", "bootstrap", "jackknife",
+    "permute", "simulate", "nestled", "stepwise", "sw", "xi", "fvset",
+})
+
+
+# Characters that cannot begin a Stata command line. This is the codebase's
+# own R20B measurement, not a fresh guess: across both authoritative roots, 91
+# real continued fragments began with one of these, and no real command does.
+# Exactly the measured set -- ( 79, [ 6, , 2, backtick 2, = 2 -- plus the
+# double quote, which is the opener that produced the reported r(199). The
+# comparison and logical operators were an addition of mine and immediately
+# mis-flagged a Stata OUTPUT row, `| make mpg |`, inside a fixture whose whole
+# purpose is output that must not be read as code. Widening a measured set by
+# intuition is how a measurement stops meaning anything.
+_FRAGMENT_OPENERS = ("(", "[", ",", "=", chr(96), chr(34))
+
+
+def command_shaped(text):
+    """Could this text begin a Stata command at all?
+
+    Deliberately narrow. An earlier version also rejected an identifier
+    followed immediately by an opening parenthesis, reasoning that `note(...)`
+    is an option fragment. That was too clever: it flagged `#delimit ;`,
+    `python:`, `input` data rows, comment lines and the closing brace of a
+    block -- six real fixtures -- because plenty of legitimate Stata lines do
+    not start with a bare command word.
+
+    So the test is the one the codebase already established by measurement: a
+    line opening with a character that cannot start a command is a
+    continuation fragment. That covers both reported failures -- the compound
+    quote opener that produced `is not a valid command name`, and the
+    parenthesised SEM continuations -- without inventing a rule about what a
+    command may look like.
+    """
+    s = str(text).strip()
+    if not s:
+        return False
+    return not s.startswith(_FRAGMENT_OPENERS)
+
+
+def _unbalanced(text):
+    """Does this command leave a quote or parenthesis open?
+
+    Only an unbalanced tail is evidence that the next line continues it. This
+    is what separates reconstructing an authored continuation from inventing
+    one: with an open delimiter the join is forced, without one it is a guess.
+    """
+    s = str(text)
+    depth = 0
+    in_dq = False
+    i = 0
+    compound = 0
+    while i < len(s):
+        two = s[i:i + 2]
+        if two == chr(96) + chr(34):
+            compound += 1
+            i += 2
+            continue
+        if two == chr(34) + chr(39) and compound:
+            compound -= 1
+            i += 2
+            continue
+        ch = s[i]
+        if ch == chr(34) and not compound:
+            in_dq = not in_dq
+        elif not in_dq and not compound:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+        i += 1
+    return depth > 0 or in_dq or compound > 0
+
+
+UNRELIABLE_RECONSTRUCTION = "UNRELIABLE_RECONSTRUCTION"
+
+
+def repair_fragments(commands):
+    """Fold fragments into the command they continue, or report unreliability.
+
+    Returns (commands, unreliable). A fragment is joined ONLY when the command
+    above it leaves a delimiter open, which is evidence-backed continuation.
+    Where no such evidence exists the sequence is reported unreliable rather
+    than executed: the specification is explicit that helprun may reconstruct
+    authored continuation and may not invent missing continuation, and running
+    an illegal command in the hope that it works is exactly the invention it
+    forbids.
+    """
+    out = []
+    unreliable = []
+    depth = 0
+
+    for command in commands:
+        text = str(command)
+
+        # Inside a brace block -- while, forvalues, foreach, if/else, program,
+        # Mata -- the body lines and the closing brace are legitimate content,
+        # not fragments. A bare `}` is not command-shaped and must not be
+        # mistaken for one: treating it as an unjustifiable fragment refused
+        # every looping example on the page.
+        if depth > 0:
+            out.append(command)
+            depth += text.count("{") - text.count("}")
+            depth = max(0, depth)
+            continue
+
+        opens = text.count("{") - text.count("}")
+
+        if command_shaped(command) or not out:
+            if not command_shaped(command) and not out:
+                unreliable.append(command)
+            out.append(command)
+            depth = max(0, depth + opens)
+            continue
+
+        if _unbalanced(out[-1]):
+            out[-1] = out[-1].rstrip() + " " + text.strip()
+            continue
+
+        # A fragment with nothing open above it. Joining would be a guess and
+        # emitting it alone is an illegal command, so neither is permitted.
+        unreliable.append(command)
+        out.append(command)
+        depth = max(0, depth + opens)
+
+    return out, unreliable
 
 
 def reconstruct_unit(path, unit, roots):
@@ -2470,7 +2687,7 @@ def reconstruct_unit(path, unit, roots):
             or visible.lstrip().startswith("> ")
             or visible.startswith(". ")
             or plausible_indented(raw, visible)
-            or line_is_marked_command(raw, here_para_start)
+            or line_is_marked_command(raw, here_para_start, paragraph_visible_text(lines, line_no - 1))
         )
 
         if alternative_branch_marker(raw, visible) and not accepted_as_code:
@@ -2718,12 +2935,12 @@ def reconstruct_unit(path, unit, roots):
         break_line_command = (
             here_break
             and block_mode is None
-            and line_is_marked_command(raw, True)
+            and line_is_marked_command(raw, True, paragraph_visible_text(lines, line_no - 1))
         )
 
         if (
             plausible_indented(raw, visible)
-            or line_is_marked_command(raw, here_para_start)
+            or line_is_marked_command(raw, here_para_start, paragraph_visible_text(lines, line_no - 1))
             or break_line_command
         ):
             if (
@@ -2766,6 +2983,17 @@ def reconstruct_unit(path, unit, roots):
     # click_run refuses with a frozen reason if it is ever clicked.
     normalized.open_block = block_mode
     normalized.last_command_line = last_command_line
+
+    # Fold continuation fragments into the command they continue, and record
+    # any fragment that cannot be justified. An unreliable unit is still
+    # RETURNED -- discarding it would hide the example from the Viewer and
+    # report the file as having no runnable content, which is the failure mode
+    # the open_block comment above describes -- and click_run refuses with the
+    # frozen reason if it is ever clicked.
+    repaired, unreliable = repair_fragments(list(normalized))
+    if repaired != list(normalized):
+        normalized[:] = repaired
+    normalized.unreliable_fragments = unreliable
 
     # Preserve authored command order exactly.  Repeated commands are
     # semantically meaningful in many help examples (for example repeated
@@ -3044,6 +3272,489 @@ def interactive_command(command):
     return token in INTERACTIVE_COMMANDS
 
 
+# ------------------------------------------------------------
+# Interactive INPUT inside a program (HPROD-34 remainder, HPROD-42).
+#
+# helprun normally executes examples in a hidden BATCH child. A program that
+# reads from the user -- `display _request(...)`, `pause`, `window stopbox`,
+# `window dialog`, `window menu`, `db` -- can never receive that input there:
+# measured, _request() returns in a millisecond with an empty value in batch
+# mode, and a program that notices c(mode)=="batch" may decline its own
+# operation while the child still exits cleanly, which helprun then reported
+# as SUCCESS (the user's varorder report).
+#
+# The general rule, keyed on what the invoked program READS, never on which
+# program it is: before execution the program each authored command resolves
+# to (as Stata resolves it) is scanned for input primitives. An example that
+# needs input runs in a VISIBLE interactive Stata that helprun launches and
+# owns, titled so the user can find it; the user answers the example's own
+# prompt there, by hand, once. helprun never types, approves, guesses, changes
+# window focus, uses the clipboard or a hook, and never touches a Stata it did
+# not launch. Stata Automation is not used (activation would be answered by
+# the user's own running Stata: experiments X5-X7b), so no registration is
+# needed and helprun never changes system registration.
+# ------------------------------------------------------------
+
+# Primitives that BLOCK the interpreter until the user acts. `window menu`,
+# `window dialog` and `db` are GUI side effects that never wait -- sysuse.ado
+# in BASE contains a `window menu` statement, and treating it as a requirement
+# routed every `sysuse` example to the visible worker (HPROD-43). `pause`
+# blocks only while pause is ON, so a program's `pause` counts only when the
+# same program (or the authored example) switches it on.
+_INTERACTIVE_INPUT_RES = (
+    ("_request()", re.compile(r"\b_request\s*\(", re.IGNORECASE)),
+    ("window stopbox", re.compile(r"\bwindow\s+stopbox\b", re.IGNORECASE)),
+)
+_PAUSE_CMD_RE = re.compile(
+    r"^\s*(?:capture\s+|noisily\s+|quietly\s+)*pause\b(?!\s+(?:on|off)\s*$)",
+    re.IGNORECASE | re.MULTILINE)
+_PAUSE_ON_RE = re.compile(r"^\s*(?:capture\s+|noisily\s+|quietly\s+)*pause\s+on\s*$",
+                          re.IGNORECASE | re.MULTILINE)
+
+_STRING_LITERAL_RE = re.compile(r'`"(?:[^"]|"(?!\x27))*"\x27|"[^"\n]*"')
+
+
+def _program_code_only(text):
+    """Strip comments and string literals so prose cannot trip the scan."""
+    out = []
+    for raw in text.splitlines():
+        s = raw
+        if s.lstrip().startswith("*"):
+            continue
+        s = re.sub(r"//.*$", "", s)
+        s = _STRING_LITERAL_RE.sub('""', s)
+        out.append(s)
+    joined = "\n".join(out)
+    joined = re.sub(r"/\*.*?\*/", "", joined, flags=re.DOTALL)
+    return joined
+
+
+def interactive_requirements(commands, roots):
+    """Which authored commands invoke a program that reads from the user.
+
+    Returns a list of dicts {command, program, primitive}; empty when no
+    authored command's resolved program source uses an input primitive.
+    Resolution goes through resolve_source_file, i.e. Stata's own findfile
+    inside Stata, so the program scanned is the one Stata would run.
+    """
+    found = []
+    seen = set()
+    authored_pause_on = False
+    for command in commands:
+        bare = strip_prefixes(command)
+        token = command_token(bare)
+        if token == "pause":
+            # Stata's documented pause semantics, not a scan of pause.ado
+            # (whose _request() IS the pause mechanism): `pause on|off` are
+            # settings and never wait; any other pause waits only while pause
+            # is on, i.e. after an authored `pause on` earlier in the example.
+            if _PAUSE_ON_RE.search(bare):
+                authored_pause_on = True
+            elif re.match(r"^\s*pause\s+off\s*$", bare, re.IGNORECASE):
+                authored_pause_on = False
+            elif authored_pause_on:
+                found.append({"command": command, "program": "(authored pause)",
+                              "primitive": "pause"})
+            continue
+        if not token or token in seen or not IDENTIFIER_RE.match(token):
+            continue
+        seen.add(token)
+        try:
+            source = resolve_source_file(token + ".ado", roots)
+        except Exception:
+            source = None
+        if source is None or not Path(source).is_file():
+            continue
+        try:
+            text = _program_code_only(
+                Path(source).read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+        for label, pattern in _INTERACTIVE_INPUT_RES:
+            if pattern.search(text):
+                found.append({"command": command, "program": str(source),
+                              "primitive": label})
+                break
+        else:
+            # `pause` blocks only when pause is on: switched on by the program
+            # itself or by the authored example
+            if _PAUSE_CMD_RE.search(text) and (
+                    _PAUSE_ON_RE.search(text) or authored_pause_on):
+                found.append({"command": command, "program": str(source),
+                              "primitive": "pause"})
+    return found
+
+
+# Trace lines, as Stata writes them with traceindent, tracenumber and
+# tracesep off: a two-character prefix at column 1.
+_TRACE_LINE_RE = re.compile(r"^[-=] ")
+_TRACE_ON_ECHO_RE = re.compile(r"^\. set trace on\s*$")
+_TRACE_OFF_ECHO_RE = re.compile(r"^\. set trace off\s*$")
+_FENCE_ECHO_RE = re.compile(r"^\. \* (HELPRUN-(?:INTERNAL|AUTHORED)-(?:BEGIN|END))\s*$")
+# A trace line that names an input primitive: the last thing Stata writes
+# before a program blocks on the user.
+_PAUSE_TRACE_RE = re.compile(
+    r"^[-=] .*(?:\b_request\s*\(|\bpause\b|\bwindow\s+stopbox\b)",
+    re.IGNORECASE)
+
+TRACE_ON_COMMANDS = ("set trace on", "set tracedepth 32", "set traceexpand off",
+                     "set traceindent off", "set tracenumber off",
+                     "set tracesep off")
+TRACE_OFF_COMMANDS = ("set trace off",)
+
+
+def strip_trace_lines(text):
+    """Drop the trace lines helprun's own bounded trace produced.
+
+    Only the span between helprun's `set trace on` and `set trace off`, which
+    are emitted inside INTERNAL fences, is affected: an authored program's own
+    output is never touched outside that span, and inside it only lines with
+    Stata's trace prefix are removed. This is a format rule scoped to
+    instrumentation helprun itself injected, not a text rule on authored
+    content. A traced source line of a branch that was NOT taken (for example
+    a program's own "declined" message under a false `if`) is trace, not
+    output, and is removed with the rest.
+    """
+    if not text:
+        return text
+    out = []
+    internal = False
+    tracing = False
+    removed_previous = False
+    for line in text.splitlines():
+        m = _FENCE_ECHO_RE.match(line)
+        if m:
+            marker = m.group(1)
+            if marker == INTERNAL_BEGIN:
+                internal = True
+            elif marker == INTERNAL_END:
+                internal = False
+            out.append(line)
+            removed_previous = False
+            continue
+        if internal and _TRACE_ON_ECHO_RE.match(line):
+            tracing = True
+        elif internal and _TRACE_OFF_ECHO_RE.match(line):
+            tracing = False
+        elif tracing and (_TRACE_LINE_RE.match(line) or line.startswith("  ")):
+            # with traceindent off, a traced NESTED line is written with a
+            # two-space prefix and no dash; still trace, still removed
+            removed_previous = True
+            continue
+        elif tracing and removed_previous and line.startswith("> "):
+            # Stata wraps a long line onto "> " continuation lines; a wrap of
+            # a removed trace line is trace too. A wrap of a KEPT line is kept.
+            continue
+        out.append(line)
+        removed_previous = False
+    return "\n".join(out)
+
+
+def worker_window_title(topic, ordinal):
+    """The visible worker's title: identifies it as helprun's, names the
+    example, and says what to do. Fixed wording, no topic-specific logic."""
+    return ("helprun worker -- %s, example %s -- when this window asks, answer "
+            "in its Command box (press Enter to confirm)" % (topic, ordinal))
+
+
+class InteractionCancelled(Exception):
+    """The user cancelled while the example waited for an answer (Break in the
+    parent, or a harness hook that declines). Nothing is answered on the
+    user's behalf and the owner stops its worker."""
+
+
+# Prompt classes (specification section 10). Decided from the prompt text the
+# authored program displayed, to shape one line of guidance and the provenance
+# record; the user's line is relayed verbatim whatever the class.
+PROMPT_ENTER_ONLY = "ENTER_ONLY"
+PROMPT_YES_NO = "YES_NO"
+PROMPT_NUMBER = "NUMBER"
+PROMPT_TEXT = "TEXT"
+PROMPT_LINE = "LINE"
+PROMPT_DIALOG = "DIALOG"   # a modal dialog: not a line, never relayed
+_PROMPT_YES_NO_RE = re.compile(
+    r"\[\s*y\s*/\s*n\s*\]|\(\s*y\s*/\s*n\s*\)|\byes\s*/\s*no\b|\by\s*/\s*n\b|\bconfirm\s*/\s*cancel\b",
+    re.IGNORECASE)
+_PROMPT_ENTER_RE = re.compile(
+    r"\b(?:press|hit)\s+(?:enter|return)\b|\benter\s+to\s+(?:continue|apply|proceed|confirm)\b",
+    re.IGNORECASE)
+_PROMPT_NUMBER_RE = re.compile(r"\b(?:number|numeric|how\s+many|integer|count)\b", re.IGNORECASE)
+_PROMPT_TEXT_RE = re.compile(
+    r"\b(?:file\s*name|filename|name|path|directory|folder|label|text|string|word|title)\b",
+    re.IGNORECASE)
+_PROMPT_SECRET_RE = re.compile(r"\b(?:password|passphrase|secret|token|api\s*key|credential)\b",
+                               re.IGNORECASE)
+
+
+def classify_prompt(text):
+    """One of the prompt classes for an authored prompt line."""
+    t = (text or "").strip()
+    if not t:
+        return PROMPT_LINE
+    if _PROMPT_YES_NO_RE.search(t):
+        return PROMPT_YES_NO
+    if _PROMPT_ENTER_RE.search(t):
+        return PROMPT_ENTER_ONLY
+    if _PROMPT_NUMBER_RE.search(t):
+        return PROMPT_NUMBER
+    if _PROMPT_TEXT_RE.search(t):
+        return PROMPT_TEXT
+    return PROMPT_LINE
+
+
+def prompt_text_from_log(log_text, since=0):
+    """The authored prompt: the last non-empty displayed line since offset
+    `since` that is neither a command echo nor a trace line."""
+    for line in reversed([l for l in log_text[since:].splitlines() if l.strip()]):
+        if not line.startswith(". ") and not _TRACE_LINE_RE.match(line):
+            return line.strip()
+    return ""
+
+
+def _worker_top_windows(pid):
+    if os.name != "nt" or not pid:
+        return []
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    EnumProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    u32.EnumWindows.argtypes = [EnumProc, wt.LPARAM]
+    u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    found = []
+
+    def top(h, _l):
+        d = wt.DWORD()
+        u32.GetWindowThreadProcessId(h, ctypes.byref(d))
+        if d.value == int(pid):
+            found.append(int(h))
+        return True
+
+    u32.EnumWindows(EnumProc(top), 0)
+    return found
+
+
+def _worker_command_window(pid):
+    """The Command window (a Scintilla control, R22-1) of the worker with THIS
+    pid; 0 when not found. Only that process's windows are ever considered."""
+    if os.name != "nt" or not pid:
+        return 0
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    EnumProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    u32.EnumChildWindows.argtypes = [wt.HWND, EnumProc, wt.LPARAM]
+    u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+    found = []
+
+    def child(h, _l):
+        b = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(h, b, 64)
+        if b.value == "Scintilla":
+            found.append(int(h))
+        return True
+
+    for top in _worker_top_windows(pid):
+        u32.EnumChildWindows(top, EnumProc(child), 0)
+        if found:
+            break
+    return found[0] if found else 0
+
+
+def relay_answer(pid, text):
+    """Deliver the user's line to the worker with `pid` (R22-3, R22-4): one
+    posted WM_CHAR per UTF-16 code unit into ITS Command window, then exactly
+    one Enter (WM_KEYDOWN/WM_KEYUP VK_RETURN). No pointer crosses processes,
+    nothing is sent anywhere but that control, and neither focus nor the
+    foreground window changes. Returns {hwnd, delivered, why}."""
+    hwnd = _worker_command_window(pid)
+    if not hwnd:
+        return {"hwnd": 0, "hwnd_pid": 0, "delivered": False,
+                "why": "no Command window found for the worker"}
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.PostMessageW.argtypes = [wt.HWND, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p]
+    u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    owner = wt.DWORD()
+    u32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+    if owner.value != int(pid):
+        # never deliver anywhere but the waiting worker's own process
+        return {"hwnd": hwnd, "hwnd_pid": int(owner.value), "delivered": False,
+                "why": "the Command window found belongs to another process"}
+    WM_KEYDOWN, WM_KEYUP, WM_CHAR, VK_RETURN = 0x0100, 0x0101, 0x0102, 0x0D
+    raw = str(text).encode("utf-16-le")
+    for i in range(0, len(raw), 2):
+        unit = raw[i] | (raw[i + 1] << 8)
+        u32.PostMessageW(hwnd, WM_CHAR, ctypes.c_void_p(unit), ctypes.c_void_p(1))
+        time.sleep(0.01)
+    time.sleep(0.2)
+    u32.PostMessageW(hwnd, WM_KEYDOWN, ctypes.c_void_p(VK_RETURN), ctypes.c_void_p(0x001C0001))
+    u32.PostMessageW(hwnd, WM_KEYUP, ctypes.c_void_p(VK_RETURN), ctypes.c_void_p(0xC01C0001))
+    return {"hwnd": hwnd, "hwnd_pid": int(owner.value), "delivered": True, "why": ""}
+
+
+def worker_window_visible(pid):
+    """Is any top-level window of the worker visible?"""
+    if os.name != "nt" or not pid:
+        return False
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.IsWindowVisible.argtypes = [wt.HWND]
+    u32.GetWindowTextLengthW.argtypes = [wt.HWND]
+    return any(u32.IsWindowVisible(h) and u32.GetWindowTextLengthW(h) > 0
+               for h in _worker_top_windows(pid))
+
+
+def _foreground_pid():
+    """The process that owns the foreground window (0 when unknown)."""
+    if os.name != "nt":
+        return 0
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.GetForegroundWindow.restype = wt.HWND
+    u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+    h = u32.GetForegroundWindow()
+    if not h:
+        return 0
+    d = wt.DWORD()
+    u32.GetWindowThreadProcessId(h, ctypes.byref(d))
+    return int(d.value)
+
+
+def worker_dialog_open(pid):
+    """The handle of a visible modal dialog (window class #32770) owned by the
+    worker with `pid`, else 0 (GATE 2 R25b). Stata's `window stopbox` shows one
+    and disables the main window while it waits; its command echo stays in
+    Stata's buffer, so the log alone cannot show this pause."""
+    if os.name != "nt" or not pid:
+        return 0
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+    u32.IsWindowVisible.argtypes = [wt.HWND]
+    for h in _worker_top_windows(pid):
+        b = ctypes.create_unicode_buffer(64)
+        u32.GetClassNameW(h, b, 64)
+        if b.value == "#32770" and u32.IsWindowVisible(h):
+            return int(h)
+    return 0
+
+
+def reveal_worker(pid):
+    """Show the hidden worker's main window: the minimum visible interaction,
+    used only when an answer cannot be relayed (unsupported prompt class, no
+    Command window, or a relay the worker did not act on)."""
+    if os.name != "nt" or not pid:
+        return False
+    import ctypes
+    import ctypes.wintypes as wt
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    u32.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+    u32.GetWindowTextLengthW.argtypes = [wt.HWND]
+    shown = False
+    for h in _worker_top_windows(pid):
+        if u32.GetWindowTextLengthW(h) > 0:
+            u32.ShowWindow(h, 1)   # SW_SHOWNORMAL, no activation request beyond Stata's own
+            shown = True
+    return shown
+
+
+def strip_streamed_prefix(transcript, streamed_lines):
+    """Drop from the front of the final transcript the lines the parent already
+    showed while relaying prompts (compared non-blank line by non-blank line),
+    so the Results bridge does not print them twice."""
+    if not streamed_lines:
+        return transcript
+    wanted = [l.rstrip() for l in streamed_lines if l.strip()]
+    if not wanted:
+        return transcript
+    lines = transcript.splitlines()
+    i = j = 0
+    while i < len(lines) and j < len(wanted):
+        if not lines[i].strip():
+            i += 1
+            continue
+        if lines[i].rstrip() != wanted[j]:
+            break
+        i += 1
+        j += 1
+    if j < len(wanted):
+        return transcript   # not a clean prefix: show everything rather than lose a line
+    return "\n".join(lines[i:]).lstrip("\n")
+
+
+def last_echoed_command(log_text):
+    """The most recent command Stata echoed into the log (`. command`)."""
+    for line in reversed(log_text.splitlines()):
+        if line.startswith(". ") and line.strip() != ".":
+            return line[2:].strip()
+    return ""
+
+
+def _process_cpu_seconds(pid):
+    """Kernel + user CPU time of a process, in seconds (0.0 when unknown).
+
+    Used to tell a worker WAITING for the user (idle) from one computing:
+    a paused interpreter consumes no CPU, a running one does.
+    """
+    if not pid or os.name != "nt":
+        return 0.0
+    try:
+        import ctypes
+        import ctypes.wintypes as wt
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return 0.0
+        try:
+            c, e, kt, ut = wt.FILETIME(), wt.FILETIME(), wt.FILETIME(), wt.FILETIME()
+            if not k32.GetProcessTimes(handle, ctypes.byref(c), ctypes.byref(e),
+                                       ctypes.byref(kt), ctypes.byref(ut)):
+                return 0.0
+            total = ((kt.dwHighDateTime << 32) + kt.dwLowDateTime
+                     + (ut.dwHighDateTime << 32) + ut.dwLowDateTime)
+            return total / 1e7
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return 0.0
+
+
+def worker_pause_detected(log_text, quiet_seconds, input_commands=(), idle=True,
+                          min_quiet=1.0):
+    """Is the worker blocked on an input primitive right now?
+
+    True when the log has not grown for `min_quiet` seconds and EITHER the
+    last command Stata echoed is one of the authored commands whose program
+    reads input (`input_commands`) while the process is idle (a waiting
+    interpreter consumes no CPU; a computing one does), OR -- for a log that
+    carries helprun's trace, as older plans did -- the last line is a trace
+    line naming an input primitive. Nothing is ever sent to the worker on this
+    basis; it only decides what the parent tells the user and whether the
+    computation timeout is running.
+    """
+    lines = [l for l in log_text.splitlines() if l.strip()]
+    if not lines or quiet_seconds < min_quiet:
+        return False
+    if _PAUSE_TRACE_RE.match(lines[-1]):
+        return True
+    if not idle:
+        return False
+    last = last_echoed_command(log_text)
+    if not last:
+        return False
+    wanted = set()
+    for command in input_commands or ():
+        first = str(command).strip().splitlines()[0].strip() if str(command).strip() else ""
+        if first:
+            wanted.add(first)
+    return last in wanted
+
+
 # ============================================================
 # Executor
 # ============================================================
@@ -3113,6 +3824,223 @@ def _split_process_segments(commands):
     return segments
 
 
+def _run_segment_worker(exe, plan, sandbox, child_env, child_job,
+                        timeout_seconds, worker):
+    """Run one plan in an interactive Stata that helprun owns, HIDDEN by default.
+
+    Returns (returncode, timed_out, completed). `completed` is whether the
+    plan's authored region reached its end in the log; a worker the user
+    closed early exits without it. The computation timeout runs only while the
+    worker is working: while it is paused on an input primitive the clock is
+    stopped. An ordinary prompt is presented in the parent through
+    worker["ask"] and the user's line is relayed to THIS worker's Command
+    window (HPROD-48); only a prompt that cannot be relayed reveals the
+    worker, and the parent is then told, once, where to answer.
+    """
+    log_path = Path(sandbox) / str(worker.get("log", Path(plan).stem + ".log"))
+
+    # `run`, not `do`: the wrapper's own lines are never echoed or displayed;
+    # only the authored segment it runs noisily reaches the window (HPROD-47).
+    # The worker starts HIDDEN (R24-1): ordinary prompts are answered in the
+    # parent and relayed here; it is shown only when a prompt cannot be
+    # relayed (HPROD-48).
+    startup = None
+    if os.name == "nt" and not worker.get("visible"):
+        startup = subprocess.STARTUPINFO()
+        startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startup.wShowWindow = 0  # SW_HIDE
+    p = subprocess.Popen(
+        [str(exe), "run", str(plan)],
+        cwd=str(sandbox),
+        env=child_env,
+        startupinfo=startup,
+    )
+    assign_process_to_job(child_job, p.pid)
+    cpu_at_quiet = _process_cpu_seconds(p.pid)
+    if worker.get("on_start"):
+        try:
+            worker["on_start"](p.pid)
+        except Exception:
+            pass
+
+    active = 0.0
+    waited = 0.0
+    pauses = 0
+    unanswered = False
+    try:
+        input_wait_limit = float(os.environ.get("HELPRUN_INPUT_WAIT_SECONDS", "0") or 0)
+    except ValueError:
+        input_wait_limit = 0.0
+    last_tick = time.time()
+    last_len = -1
+    quiet_since = time.time()
+    paused = False
+    announced = False
+    timed_out = False
+    cancelled = False
+    revealed = bool(worker.get("visible"))
+    interactions = []
+    streamed = []
+    relay_offset = 0
+    relayed_at = None
+    ask = worker.get("ask")
+    relayable = worker.get("relayable", True)
+
+    while True:
+        time.sleep(0.25)
+        now = time.time()
+        text = ""
+        if log_path.is_file():
+            try:
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
+        if len(text) != last_len:
+            last_len = len(text)
+            quiet_since = now
+            cpu_at_quiet = _process_cpu_seconds(p.pid)
+            if paused and interactions and interactions[-1].get("resumed") is None:
+                interactions[-1]["resumed"] = True
+            paused = False
+            relayed_at = None
+        idle = (_process_cpu_seconds(p.pid) - cpu_at_quiet) < 0.05
+        # A modal dialog is a pause the log cannot show (R25b): the worker owns
+        # a visible #32770 window while its echo is still buffered.
+        dialog = worker_dialog_open(p.pid) if (now - quiet_since) >= 1.0 else 0
+        if not paused and dialog:
+            paused = True
+            pauses += 1
+            interactions.append({
+                "ordinal": pauses, "prompt": "modal dialog", "class": PROMPT_DIALOG,
+                "answer": "(answered in the worker window)", "relayed_at": "-",
+                "hwnd": dialog, "hwnd_pid": int(p.pid), "delivered": False,
+                "resumed": None, "why": "a dialog cannot be relayed",
+                # provenance for the focus hazard (0.6.2): did the worker's
+                # dialog hold the foreground when it was noticed?
+                "foreground": _foreground_pid() == int(p.pid)})
+            if not revealed:
+                revealed = reveal_worker(p.pid)
+            if not announced and worker.get("on_pause"):
+                announced = True
+                try:
+                    worker["on_pause"]()
+                except Exception:
+                    pass
+        elif not paused and worker_pause_detected(text, now - quiet_since,
+                                                  worker.get("input_commands", ()), idle):
+            paused = True
+            pauses += 1
+            prompt = prompt_text_from_log(text, relay_offset)
+            kind = classify_prompt(prompt)
+            delta = text[relay_offset:]
+            if ask is not None and relayable:
+                # PARENT-MEDIATED (HPROD-48): show what the example displayed
+                # since the last answer, ask in the parent, relay the line to
+                # THIS worker only. `ask` returns the user's line, or None when
+                # nobody is there to answer (unattended: the bounded wait
+                # below applies), or raises InteractionCancelled.
+                info = {"ordinal": pauses, "prompt": prompt, "class": kind,
+                        "transcript": delta, "pid": p.pid, "title": worker.get("title", "")}
+                try:
+                    answer = ask(info)
+                except InteractionCancelled:
+                    cancelled = True
+                    terminate_job(child_job)
+                    try:
+                        p.kill()
+                    except OSError:
+                        pass
+                    p.wait()
+                    break
+                streamed.extend(delta.splitlines())
+                relay_offset = len(text)
+                if answer is not None:
+                    res = relay_answer(p.pid, answer)
+                    secret = bool(_PROMPT_SECRET_RE.search(prompt or ""))
+                    interactions.append({
+                        "ordinal": pauses, "prompt": prompt, "class": kind,
+                        "answer": ("(withheld)" if secret else str(answer)),
+                        "relayed_at": time.strftime("%H:%M:%S"), "hwnd": res.get("hwnd", 0),
+                        "hwnd_pid": res.get("hwnd_pid", 0),
+                        "delivered": bool(res.get("delivered")), "resumed": None,
+                        "why": res.get("why", "")})
+                    relayed_at = now
+                    if not res.get("delivered") and not revealed:
+                        revealed = reveal_worker(p.pid)
+                        if worker.get("on_pause"):
+                            try:
+                                worker["on_pause"]()
+                            except Exception:
+                                pass
+            elif not revealed:
+                # not relayable (a modal dialog, or no way to ask): the minimum
+                # visible interaction -- show the worker and say where to answer
+                revealed = reveal_worker(p.pid)
+                if not announced and worker.get("on_pause"):
+                    announced = True
+                    try:
+                        worker["on_pause"]()
+                    except Exception:
+                        pass
+        if paused and relayed_at is not None and now - relayed_at > 15 and not revealed:
+            # the worker did not act on a delivered answer within 15 s: reveal it
+            interactions[-1]["resumed"] = False
+            revealed = reveal_worker(p.pid)
+            if worker.get("on_pause"):
+                try:
+                    worker["on_pause"]()
+                except Exception:
+                    pass
+        if not paused:
+            active += now - last_tick
+        else:
+            waited += now - last_tick
+        last_tick = now
+        if p.poll() is not None:
+            if interactions and interactions[-1].get("resumed") is None:
+                interactions[-1]["resumed"] = True
+            break
+        if paused and input_wait_limit > 0 and waited > input_wait_limit:
+            # Nobody answered within the configured bound. The owner stops its
+            # own worker; nothing is answered on the user's behalf.
+            unanswered = True
+            terminate_job(child_job)
+            try:
+                p.kill()
+            except OSError:
+                pass
+            p.wait()
+            break
+        if active > timeout_seconds:
+            timed_out = True
+            terminate_job(child_job)
+            try:
+                p.kill()
+            except OSError:
+                pass
+            p.wait()
+            break
+
+    text = ""
+    if log_path.is_file():
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+    # The wrapper writes the marker only after the authored region ran to its
+    # end; an authored error or a window closed by the user leaves none.
+    completed = (Path(sandbox) / WORKER_DONE_MARKER).is_file()
+    worker["pauses"] = pauses
+    worker["waited_seconds"] = round(waited, 1)
+    worker["pid"] = p.pid
+    worker["unanswered"] = unanswered
+    worker["cancelled"] = cancelled
+    worker["revealed"] = revealed
+    worker["interactions"] = interactions
+    worker["streamed_lines"] = streamed
+    return p.returncode, timed_out, completed
+
+
 def execute_units(
     exe,
     selected_units,
@@ -3120,7 +4048,10 @@ def execute_units(
     source_dir=None,
     roots=None,
     timeout_seconds=90,
-    capture=None
+    capture=None,
+    staged_inputs=None,
+    worker=None,
+    trace_commands=()
 ):
     commands = []
 
@@ -3172,6 +4103,26 @@ def execute_units(
             prefix="helprun_" + label + "_"
         )
     )
+
+    # Authored data inputs the caller already resolved. Resolution alone is not
+    # enough: the child runs in the sandbox, so a file the PARENT could see at
+    # a relative path is invisible to it, and a legitimate authored input then
+    # reports DATA_FILE_MISSING with r(601) purely because execution moved. The
+    # resolved file is copied in under the name the example uses.
+    #
+    # An input is never overwritten if the sandbox already holds that name: a
+    # package dependency staged under the same name wins, because it is the one
+    # the example's own package shipped.
+    for _name, _source_path in (staged_inputs or []):
+        try:
+            _target = sandbox / Path(_name).name
+            if not _target.exists():
+                shutil.copyfile(_source_path, _target)
+        except OSError:
+            # A file that cannot be copied is left unresolved rather than
+            # silently substituted; the child then fails on the authored
+            # command, which is the honest outcome.
+            pass
 
     try:
         _stage_package_dependencies(
@@ -3244,48 +4195,85 @@ def execute_units(
         else:
             segment_capture = None
 
+        trace_indices = [i for i, c in enumerate(segment)
+                         if c in set(trace_commands)]
+        worker_spec = None
+        if worker is not None:
+            worker_spec = dict(worker)
+            worker_spec["log"] = plan.stem + ".log"
+            worker_spec["input_commands"] = tuple(trace_commands)
+
         plan.write_text(
-            "\n".join(build_child_plan(segment, segment_capture)) + "\n",
+            "\n".join(build_child_plan(segment, segment_capture,
+                                       trace_indices)) + "\n",
             encoding="utf-8",
         )
 
-        p = subprocess.Popen(
-            [
-                str(exe),
-                "/e",
-                "/q",
-                "/i",
-                "do",
-                str(plan),
-            ],
-            cwd=str(sandbox),
-            env=child_env,
-            startupinfo=startup,
-            creationflags=creation_flags,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-
-        child_pids.append(p.pid)
-        assign_process_to_job(child_job, p.pid)
         timeout = False
+        worker_completed = True
 
-        try:
-            p.wait(timeout=timeout_seconds)
+        if worker is not None:
+            # An example whose program reads input runs in a VISIBLE Stata the
+            # user can answer in (HPROD-42). Same fenced plan, same sandbox,
+            # same log file name; the plan is run through a fenced wrapper
+            # do-file so the worker logs, survives an authored error, echoes
+            # Stata's return code, and exits by itself.
+            # The authored segment alone, as one nested do-file the silent
+            # wrapper runs noisily: the worker's window and log show exactly
+            # the authored commands and their output (HPROD-47).
+            authored = sandbox / (plan.stem + "_authored.do")
+            authored.write_text(chr(10).join(segment) + chr(10), encoding="utf-8")
+            wrapper = sandbox / (plan.stem + "_worker.do")
+            wrapper.write_text(
+                chr(10).join(build_worker_wrapper(worker_spec, authored.name,
+                                                  segment_capture)) + chr(10),
+                encoding="utf-8",
+            )
 
-        except subprocess.TimeoutExpired:
-            timeout = True
+            class _Worker(object):
+                pass
+            p = _Worker()
+            p.pid = None
+            p.returncode, timeout, worker_completed = _run_segment_worker(
+                exe, wrapper, sandbox, child_env, child_job, timeout_seconds,
+                worker_spec)
+        else:
+            p = subprocess.Popen(
+                [
+                    str(exe),
+                    "/e",
+                    "/q",
+                    "/i",
+                    "do",
+                    str(plan),
+                ],
+                cwd=str(sandbox),
+                env=child_env,
+                startupinfo=startup,
+                creationflags=creation_flags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
-            # Terminate the whole job first: killing only the direct child
-            # would leave any grandchild it spawned running (GATE 2 R19).
-            terminate_job(child_job)
+            child_pids.append(p.pid)
+            assign_process_to_job(child_job, p.pid)
 
             try:
-                p.kill()
-            except OSError:
-                pass
+                p.wait(timeout=timeout_seconds)
 
-            p.wait()
+            except subprocess.TimeoutExpired:
+                timeout = True
+
+                # Terminate the whole job first: killing only the direct child
+                # would leave any grandchild it spawned running (GATE 2 R19).
+                terminate_job(child_job)
+
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
+                p.wait()
 
         segment_log_file = sandbox / (plan.stem + ".log")
 
@@ -3296,6 +4284,16 @@ def execute_units(
             )
         else:
             segment_log = ""
+
+        if worker is not None and segment_log:
+            # The worker's log is the authored region alone; give it the
+            # fences every downstream filter selects by, and keep the file
+            # consistent with what the filters see.
+            segment_log = fence_worker_log(segment_log, worker_completed)
+            try:
+                segment_log_file.write_text(segment_log, encoding="utf-8")
+            except OSError:
+                pass
 
         segment_r_codes = re.findall(
             r"(?m)^r\(([0-9]+)\);",
@@ -3316,10 +4314,57 @@ def execute_units(
 
         segment_pass = (
             not timeout
-            and p.returncode == 0
+            and (p.returncode == 0 or worker is not None)
             and segment_log_file.exists()
             and not segment_r_codes
+            and worker_completed
         )
+
+        if (worker is not None and not timeout and not worker_completed
+                and not segment_r_codes):
+            # The worker exited before the authored region ended and without
+            # an error of its own: either nobody answered within the
+            # configured bound (HELPRUN_INPUT_WAIT_SECONDS) and the owner
+            # stopped its worker, or the user closed the window. Nothing was
+            # confirmed on the user's behalf and this is not reported as
+            # SUCCESS. (An authored error is classified from the log like any
+            # other run.)
+            close_job(child_job)
+            if worker_spec.get("cancelled"):
+                message = (
+                    "helprun: the example was waiting for your answer and the run "
+                    "was cancelled; the worker was closed and nothing was confirmed "
+                    "on your behalf"
+                )
+            elif worker_spec.get("unanswered"):
+                message = (
+                    "helprun: the example asked for your answer and none was given "
+                    "within %s seconds; the worker was closed and nothing was "
+                    "confirmed on your behalf"
+                    % os.environ.get("HELPRUN_INPUT_WAIT_SECONDS", "")
+                )
+            else:
+                message = (
+                    "helprun: the example was waiting for your answer in its "
+                    "worker window, and that window closed before the example "
+                    "completed; nothing was confirmed on your behalf"
+                )
+            return {
+                "status": STATUS_FAILED,
+                "reason": "INTERACTIVE_INPUT_REQUIRED",
+                "child": True,
+                "pass": False,
+                "child_pid": None,
+                "child_pids": child_pids,
+                "sandbox": str(sandbox),
+                "temp_root": str(child_temp),
+                "logfile": str(segment_log_file) if segment_log_file.exists() else "",
+                "r_codes": all_r_codes,
+                "pre_existing": pre_existing,
+                # the pause the user saw is evidence on EVERY path (HHARN-43a)
+                "interactive": _worker_evidence(worker, worker_spec),
+                "error": message,
+            }
 
         if not segment_pass:
             if len(segments) > 1:
@@ -3379,13 +4424,16 @@ def execute_units(
                 "reason": "EXECUTION_TIMEOUT" if timeout else "",
                 "child": True,
                 "pass": False,
-                "child_pid": child_pids[-1],
+                # a worker run records no batch child pid (HPROD-42)
+                "child_pid": child_pids[-1] if child_pids else None,
                 "child_pids": child_pids,
                 "sandbox": str(sandbox),
                 "temp_root": str(child_temp),
                 "logfile": str(combined_log) if combined_log.exists() else "",
                 "r_codes": all_r_codes,
                 "pre_existing": pre_existing,
+                # the pause the user saw is evidence on EVERY path (HHARN-43a)
+                "interactive": _worker_evidence(worker, worker_spec),
                 "error": error,
             }
 
@@ -3406,7 +4454,7 @@ def execute_units(
         "reason": "",
         "child": True,
         "pass": True,
-        "child_pid": child_pids[-1],
+        "child_pid": child_pids[-1] if child_pids else None,
         "child_pids": child_pids,
         "sandbox": str(sandbox),
         "temp_root": str(child_temp),
@@ -3415,8 +4463,55 @@ def execute_units(
         "pre_existing": pre_existing,
         "child_temp": str(child_temp),
         "segments": len(segments),
+        "interactive": _worker_evidence(worker, worker_spec),
         "error": "",
     }
+
+
+def _worker_evidence(worker, worker_spec):
+    """What the persistent log records about a run's interactive worker.
+
+    Returned on EVERY path out of execute_units -- success, authored failure,
+    unanswered, cancelled or closed worker -- so a run that paused for the
+    user and then ended FAILED still carries its INTERACTIVE and PROMPT header
+    lines (HHARN-43a, HPROD-48). None for a hidden batch child.
+    """
+    if worker is None or worker_spec is None:
+        return None
+    return {"title": worker_spec.get("title", ""),
+            "pauses": worker_spec.get("pauses", 0),
+            "waited_seconds": worker_spec.get("waited_seconds", 0),
+            "pid": worker_spec.get("pid"),
+            "hidden": not worker_spec.get("visible", False),
+            "revealed": bool(worker_spec.get("revealed")),
+            "cancelled": bool(worker_spec.get("cancelled")),
+            "interactions": list(worker_spec.get("interactions") or []),
+            "streamed_lines": list(worker_spec.get("streamed_lines") or [])}
+
+
+def interactive_header_lines(interactive):
+    """The INTERACTIVE and PROMPT header lines for a run that used a worker:
+    the same wording on the SUCCESS and FAILED paths (HPROD-48 provenance)."""
+    if not interactive:
+        return []
+    lines = [
+        "INTERACTIVE : %s worker %r; paused %d time(s) for the user's answer, "
+        "waited %s s%s"
+        % ("hidden" if interactive.get("hidden") and not interactive.get("revealed")
+           else "visible",
+           interactive.get("title", ""),
+           interactive.get("pauses", 0),
+           interactive.get("waited_seconds", 0),
+           "; cancelled by the user" if interactive.get("cancelled") else "")]
+    for it in interactive.get("interactions") or []:
+        resumed = it.get("resumed")
+        lines.append(
+            "PROMPT %-6d: %s %r -> answer %r, relayed %s, %s"
+            % (it.get("ordinal", 0), it.get("class", ""),
+               redact_secrets(str(it.get("prompt", "")))[:120],
+               redact_secrets(str(it.get("answer", ""))), it.get("relayed_at", ""),
+               "resumed" if resumed else ("not resumed" if resumed is False else "pending")))
+    return lines
 
 
 # ============================================================
@@ -3621,6 +4716,147 @@ def unit_referenced_names(unit):
     return names
 
 
+# Commands after which the variable set is whatever Stata makes it.
+#
+# WHY A BOUNDARY AND NOT A LONGER LIST OF PRODUCERS
+#
+# The planner used to require every identifier a unit mentions in a varlist
+# position, minus a list of names it could see being created -- gen, egen,
+# rename, input and a few others. That list can never be complete. collapse
+# invents _freq and the statistic variables; contract invents _freq; reshape
+# invents the wide or long forms; merge brings in the whole using dataset;
+# a later use, webuse or import replaces the variable set outright. Every
+# omission becomes a false refusal of a perfectly good example, and the real
+# a real installed help Example was refused for exactly that reason -- for
+# annual_range, cities, demand_type, mean_degree_days, median_degree_days,
+# percentage and total_degree_days, all of which the example itself produces.
+#
+# Extending the producer list is the wrong shape of fix: it would have to
+# anticipate every command that can add a variable, which is a Stata
+# interpreter, and the specification forbids building one.
+#
+# So the rule is inverted and bounded. A variable is a genuine INITIAL
+# prerequisite only while the planner can still know what the dataset holds --
+# that is, until the first command that can change it. From that point the
+# authored sequence is authoritative and the planner stops requiring anything,
+# because Stata is the authority on evolving dataset state. This names no
+# command that produces any particular variable; it names the point after
+# which the planner has no standing to judge.
+# A command that LOADS a dataset establishes a state the planner can check
+# against: it knows which file was loaded and can ask Stata for its varlist.
+DATASET_LOADERS = frozenset({
+    "use", "u", "sysuse", "webuse", "import", "infile", "insheet", "odbc",
+})
+
+# A command after which the variable set is whatever Stata makes it. These do
+# not establish a state the planner can inspect -- they transform one.
+DATASET_MUTATORS = frozenset({
+    "collapse", "contract", "reshape", "merge", "append", "joinby", "cross",
+    "expand", "fillin", "stack", "xpose", "separate", "split",
+    "generate", "gen", "egen", "rename", "ren", "drop", "keep",
+    "encode", "decode", "destring", "tostring", "recode", "input",
+    "restore", "nestrestore", "clear", "frame", "frames",
+})
+
+_OPTION_CREATES_RE = re.compile(
+    r"(?:gen|generate)\s*\(", flags=re.IGNORECASE)
+
+
+def _leading_command(line):
+    s = line.strip()
+    if not s or s.startswith("*") or s.startswith("//"):
+        return ""
+    s = re.sub(r"^(?:quietly|qui|noisily|noi|capture|cap)\s+", "", s,
+               flags=re.IGNORECASE)
+
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)", s)
+    first = m.group(1).lower() if m else ""
+
+    # Resolve the leading word BEFORE any colon handling. `merge 1:1 make
+    # using other` contains a colon that belongs to the match specification,
+    # not to a prefix command; treating it as one discarded the merge entirely
+    # and let a merged-in variable be demanded up front. A command that already
+    # names itself needs no prefix interpretation.
+    if first in DATASET_LOADERS or first in DATASET_MUTATORS:
+        return first
+
+    # Otherwise a prefix command may carry its own colon; judge what follows.
+    if ":" in s:
+        head, _, rest = s.partition(":")
+        # A prefix head carries a varlist, options and parentheses --
+        # `bysort id (t):`, `svy, subpop(male):`. Restricting it to bare words
+        # meant those fell through to the prefix word itself, so an egen or
+        # collapse behind a by-prefix was never seen as a state change.
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_ ,()*?~.=<>!&|/+-]*$",
+                    head.strip()):
+            m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)", rest.strip())
+            return m.group(1).lower() if m else ""
+
+    return first
+
+
+def first_state_change(unit):
+    """Index of the first command after which the variable set is unknown.
+
+    WHY A BOUNDARY AND NOT A LONGER LIST OF PRODUCERS
+
+    The planner used to require every identifier a unit mentions in a varlist
+    position, minus a list of names it could see being created -- gen, egen,
+    rename, input and a few others. That list can never be complete. collapse
+    invents _freq and the statistic variables; contract invents _freq; reshape
+    invents the wide or long forms; merge brings in the whole using dataset.
+    Every omission becomes a false refusal of a good example, and the real
+    a real installed help Example was refused for exactly that reason -- for
+    annual_range, cities, demand_type, mean_degree_days, median_degree_days,
+    percentage and total_degree_days, every one of which it produces itself.
+
+    Extending the producer list is the wrong shape of fix: it would have to
+    anticipate every command that can add a variable, which is a Stata
+    interpreter, and the specification forbids building one.
+
+    So the rule is inverted and bounded. The FIRST dataset load establishes a
+    state the planner can inspect, and it keeps its standing to judge until the
+    authored sequence transforms that state -- a mutator, or a second load of a
+    different dataset. After that point Stata is authoritative, exactly as the
+    frozen rule says, and the planner requires nothing further. This names no
+    command that produces any particular variable; it names the point after
+    which the planner has no standing.
+    """
+    seen_loader = False
+
+    for i, command in enumerate(unit["code"]):
+        word = _leading_command(command)
+        if not word:
+            continue
+
+        if word in DATASET_LOADERS:
+            if seen_loader:
+                # a second, different dataset: the earlier varlist no longer
+                # describes what is in memory
+                return i
+            seen_loader = True
+            continue
+
+        if word in DATASET_MUTATORS:
+            return i
+
+        if _OPTION_CREATES_RE.search(command):
+            return i
+
+    return len(unit["code"])
+
+
+def judgeable_prefix(unit):
+    """The unit, truncated at the first command that can change the data.
+
+    Only this prefix may be used to decide what the example needs BEFORE it
+    runs. Everything after it is the authored sequence doing its work, and
+    Stata decides whether that succeeds.
+    """
+    cut = first_state_change(unit)
+    return {"code": list(unit["code"])[:cut]}
+
+
 def unit_varlist_candidates(unit):
     """Identifiers used in a varlist position of a recognised data command.
 
@@ -3727,7 +4963,7 @@ def plan_prerequisites(units, target, roots):
 
     require(target["ordinal"])
 
-    needs_data = bool(unit_varlist_candidates(target)) or any(
+    needs_data = bool(unit_varlist_candidates(judgeable_prefix(target))) or any(
         re.match(
             r"^(gen|generate|egen|replace)\b", c.strip(), flags=re.IGNORECASE
         )
@@ -3784,7 +5020,7 @@ def plan_prerequisites(units, target, roots):
 
         unmet = sorted(
             token
-            for token in unit_varlist_candidates(target)
+            for token in unit_varlist_candidates(judgeable_prefix(target))
             if token not in available and token not in creator_of
         )
 
@@ -4749,10 +5985,17 @@ def resolve_data_references(commands, ctx, unit_lines):
 
         found = None
 
+        # Resolution precedence. The parent working directory sits after the
+        # sandbox and the help/package source, and before the adopath search
+        # below: a file the parent can see is a legitimate input, and the only
+        # reason it was missing is that the child runs elsewhere. Section 8
+        # requires a resolved input to be STAGED into the child environment,
+        # which is what the caller does with the returned pairs.
         for base in (
             ctx.get("sandbox"),
             ctx.get("source_dir"),
             ctx.get("out_dir"),
+            ctx.get("parent_pwd"),
         ):
             if not base:
                 continue
@@ -4908,31 +6151,180 @@ AUTHORED_BEGIN = "HELPRUN-AUTHORED-BEGIN"
 AUTHORED_END = "HELPRUN-AUTHORED-END"
 GSNAP_CALL = "capture _hr_gsnap"
 
+# Structural provenance. Every line of a child plan belongs to exactly one of
+# three classes, and the plan says which rather than leaving it to be guessed
+# from the text:
+#
+#   AUTHORED              a command the help author wrote
+#   PREREQUISITE_AUTHORED authored setup an earlier part of the page supplies
+#   HELPRUN_INTERNAL      instrumentation helprun injected
+#
+# Only the first two may reach the user-facing log. Classifying by REGION
+# rather than by matching text is what makes an authored `capture drop x`
+# survive while `capture _hr_gsnap` does not: the two are textually similar and
+# structurally unrelated, so any text rule would have to choose between
+# deleting authored code and leaking instrumentation.
+INTERNAL_BEGIN = "HELPRUN-INTERNAL-BEGIN"
+INTERNAL_END = "HELPRUN-INTERNAL-END"
 
-def build_child_plan(commands, capture):
-    """Interleave read-only capture instrumentation into one child plan."""
+PROVENANCE_AUTHORED = "AUTHORED"
+PROVENANCE_PREREQ = "PREREQUISITE_AUTHORED"
+PROVENANCE_INTERNAL = "HELPRUN_INTERNAL"
+
+
+def build_child_plan(commands, capture, trace_indices=(), worker=None):
+    """Interleave read-only capture instrumentation into one child plan.
+
+    Injected instrumentation is fenced by INTERNAL markers so its provenance is
+    a structural fact about the plan rather than something a later reader has
+    to infer. The per-command graph hook sits inside the authored region by
+    necessity -- it must run between authored commands -- so it is fenced
+    individually.
+
+    `trace_indices` names the authored commands whose program reads input:
+    Stata's trace is switched on immediately before and off immediately after
+    each, inside INTERNAL fences, so the parent can see the exact moment the
+    program blocks on its request. The trace lines are helprun instrumentation
+    and are stripped from every user-facing surface by strip_trace_lines.
+
+    `worker` (a dict with "title" and "log") makes this a plan for the VISIBLE
+    interactive worker: unlike a batch child, an interactive Stata neither logs
+    by itself nor exits at the end of a do-file, so the plan opens its own log,
+    titles its window, and exits Stata when done -- all inside INTERNAL fences.
+    """
+    trace_indices = set(trace_indices or ())
+
+    def traced(index, command):
+        if index not in trace_indices:
+            return [command]
+        block = ["* " + INTERNAL_BEGIN]
+        block.extend(TRACE_ON_COMMANDS)
+        block.append("* " + INTERNAL_END)
+        block.append(command)
+        block.append("* " + INTERNAL_BEGIN)
+        block.extend(TRACE_OFF_COMMANDS)
+        block.append("* " + INTERNAL_END)
+        return block
+
+    out = []
+
     if not capture:
-        return (["* " + AUTHORED_BEGIN]
-                + list(commands)
-                + ["* " + AUTHORED_END])
+        body = []
+        for index, command in enumerate(commands):
+            body.extend(traced(index, command))
+        out.extend(["* " + AUTHORED_BEGIN] + body + ["* " + AUTHORED_END])
+    else:
+        out.append("* " + INTERNAL_BEGIN)
+        out.extend(graph_capture_preamble())
+        out.append("* " + INTERNAL_END)
 
-    out = list(graph_capture_preamble())
-    flags = top_level_flags(commands)
+        flags = top_level_flags(commands)
 
-    out.append("* " + AUTHORED_BEGIN)
+        out.append("* " + AUTHORED_BEGIN)
 
-    for command, safe in zip(commands, flags):
-        out.append(command)
-        if safe:
-            out.append(GSNAP_CALL)
+        for index, (command, safe) in enumerate(zip(commands, flags)):
+            out.extend(traced(index, command))
+            if safe:
+                out.append("* " + INTERNAL_BEGIN)
+                out.append(GSNAP_CALL)
+                out.append("* " + INTERNAL_END)
 
-    out.append("* " + AUTHORED_END)
+        out.append("* " + AUTHORED_END)
 
-    out.extend(
-        graph_capture_postamble(capture["out_dir"], capture["basename"])
-    )
+        out.append("* " + INTERNAL_BEGIN)
+        out.extend(
+            graph_capture_postamble(capture["out_dir"], capture["basename"])
+        )
+        out.append("* " + INTERNAL_END)
 
     return out
+
+
+WORKER_DONE_MARKER = "DONE.hrworker"
+WORKER_GUIDANCE = ("helprun: when this window asks you something, answer in its "
+                   "Command box (press Enter to confirm); it closes by itself when "
+                   "the example has finished.")
+
+
+def build_worker_wrapper(worker, authored_name, capture=None):
+    """The file the VISIBLE worker is launched with -- through `run`, silently.
+
+    The worker's window is a user-facing surface: the user answers the
+    example's prompt there. It must show only the authored commands, their
+    output, the prompt, the result and Stata's own errors, plus one line of
+    guidance -- never helprun's orchestration (HPROD-47). Stata's `run`
+    executes a file without echoing its lines or their output, and a nested
+    `noisily do` inside it echoes exactly the nested file: so this wrapper is
+    launched with `run`, does its work silently (title, log, graph-capture
+    preamble/postamble, completion marker, exit), and executes the authored
+    segment -- authored commands only, in `authored_name` -- as one noisy
+    nested do-file, whose echo is the same `. command` / output stream a batch
+    child produces. No trace is switched on: the pause is detected from the
+    log's last echoed command and the process's idleness.
+
+    An interactive Stata neither logs by itself nor exits at the end of a
+    file, and after an authored error it stops and stays open, so the wrapper
+    opens the log, runs the authored file under `capture noisily do`, writes
+    Stata's return code in its standard `r(N);` form when the body failed (the
+    line a batch child prints), writes the completion marker only when the
+    authored region ran to its end, closes the log and exits Stata. The
+    guidance line is displayed before the log opens, so it is seen but is not
+    part of the run's transcript.
+    """
+    title = str(worker.get("title", "helprun worker")).replace('"', "'")
+    lines = [
+        'window manage maintitle "%s"' % title,
+        "set more off",
+        'noisily display as text "%s"' % WORKER_GUIDANCE.replace('"', "'"),
+        "capture log close hrworker",
+        'log using "%s", replace text name(hrworker)' % str(worker.get("log", "plan.log")),
+    ]
+    if capture:
+        # the capture instrumentation runs silently here: its `noisily` was
+        # for the batch child's fenced log, and would surface `(file saved)`
+        # messages on the worker's user-facing surface
+        lines.extend(l.replace("capture noisily ", "capture ") for l in graph_capture_preamble())
+    lines.extend([
+        'capture noisily do "%s"' % authored_name,
+        "local hrworker_rc = _rc",
+        "if `hrworker_rc' != 0 {",
+        "    noisily display as error \"r(`hrworker_rc');\"",
+        "}",
+        "else {",
+    ])
+    if capture:
+        lines.extend("    " + l.replace("capture noisily ", "capture ") for l in
+                     graph_capture_postamble(capture["out_dir"], capture["basename"]))
+    lines.extend([
+        "    tempname hrdone",
+        '    file open `hrdone\' using "%s", write replace text' % WORKER_DONE_MARKER,
+        "    file write `hrdone' \"completed\" _n",
+        "    file close `hrdone'",
+        "}",
+        "capture log close hrworker",
+        "exit, clear STATA",
+    ])
+    return lines
+
+
+def fence_worker_log(text, completed):
+    """Give a worker log the fences the batch child's log carries.
+
+    The worker's log holds the authored region only (the wrapper is silent),
+    so the shared transcript filters, which select by fence, need the region
+    marked. The nested do-file's own epilogue (`end of do-file` and the blank
+    echo before it) is trimmed before the closing fence; an unfinished run --
+    an authored error, or a window the user closed -- stays unclosed, exactly
+    like an aborted batch child, so the same epilogue rule applies to it.
+    """
+    lines = text.splitlines()
+    if completed:
+        while lines and (lines[-1].strip() in ("", ".") or _BATCH_EPILOGUE_RE.match(lines[-1].strip())):
+            lines.pop()
+    out = [". * " + AUTHORED_BEGIN] + lines
+    if completed:
+        out.append(". * " + AUTHORED_END)
+    return chr(10).join(out) + chr(10)
 
 
 # Stata's own batch epilogue, which follows the authored region when a
@@ -4941,71 +6333,125 @@ def build_child_plan(commands, capture):
 _BATCH_EPILOGUE_RE = re.compile(r'^(?:end of do-file|r\([0-9]+\);)$')
 
 
-def results_transcript(child_log):
-    """The authored region of a child log, fit for parent Results.
+def user_facing_transcript(child_log):
+    """The child transcript with every HELPRUN_INTERNAL region removed.
 
-    Section 12.1A: ordinary Results must resemble normal interactive Stata. It
-    must never carry the Stata batch banner, the run-log header, helprun's
-    graph-capture instrumentation, or duplicate streams. Everything stripped
-    here is still preserved in full in the persistent log.
+    WHY THIS IS SHARED WITH THE RESULTS BRIDGE
+
+    The persistent log used to embed the RAW child transcript verbatim, under a
+    `CHILD OUTPUT` heading, while only parent Results was filtered. The
+    docstring of the Results filter said so plainly -- "Everything stripped
+    here is still preserved in full in the persistent log" -- and that is
+    exactly what shipped: users opening topic-example-N.log found
+    HELPRUN-AUTHORED markers, the _hr_gsnap program definition, its
+    capture/program drop/global/foreach instrumentation, graph save/use/export
+    calls, sandbox and TEMP paths, and Stata's wrapper epilogue.
+
+    The clean-output validation checked parent Results and never opened the
+    log, so it passed throughout. One filter now serves both surfaces, which is
+    what stops them diverging again.
+
+    Filtering is by REGION, never by text. An authored `capture drop x` is
+    inside the authored region and survives; `capture _hr_gsnap` is inside an
+    internal region and does not.
     """
     if not child_log:
         return ""
 
-    lines = child_log.splitlines()
+    lines = strip_trace_lines(child_log).splitlines()
 
-    start = None
-    stop = None
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if AUTHORED_BEGIN in stripped:
-            start = i + 1
-        elif AUTHORED_END in stripped:
-            stop = i
-            break
-
-    if start is None:
-        # No marker: the child died before reaching the authored region, so
-        # there is no ordinary transcript to show. The caller falls back to the
-        # concise causal diagnostic.
-        return ""
-
-    if stop is None:
-        # The child failed, so it never reached the closing marker and the
-        # slice would otherwise run on into Stata's batch epilogue.
-        # Everything after the authored region is batch scaffolding: the
-        # `end of do-file` line and the final `r(NNN);`. Section 12.1A forbids
-        # both from ordinary Results, and the ado prints the causal message and
-        # its code itself, so leaving them would also duplicate the code.
-        stop = len(lines)
-        for i in range(start, len(lines)):
-            if _BATCH_EPILOGUE_RE.match(lines[i].strip()):
-                stop = i
-                break
-
-    body = lines[start:stop]
+    # A child that ABORTS never reaches AUTHORED_END: Stata stops at the
+    # failing command, prints its epilogue -- `end of do-file` and the final
+    # `r(NNN);` -- and exits. The epilogue is then inside the still-open
+    # authored region, and the first shared-filter version let it through on
+    # every failed run (A58, I26, and the GATE 5 baseline all caught it). The
+    # authored error message itself is kept: it is the meaningful Stata error
+    # the user needs. Only when the region never closes is the epilogue cut,
+    # so an authored `capture` that prints an r() code mid-example and carries
+    # on is untouched.
+    region_closed = any(AUTHORED_END in (l.strip()[1:].strip()
+                                         if l.strip().startswith(".")
+                                         else l.strip())
+                        for l in lines)
 
     out = []
-    for line in body:
-        stripped = line.strip()
-        if stripped == "." or stripped == "":
-            out.append("")
-            continue
-        # Drop the echo of the per-command capture hook and of the markers.
-        if stripped in (". " + GSNAP_CALL, GSNAP_CALL):
-            continue
-        if AUTHORED_BEGIN in stripped or AUTHORED_END in stripped:
-            continue
-        out.append(line)
+    depth = 0
+    seen_authored = False
+    in_authored = False
 
-    # Collapse the blank runs that removing instrumentation leaves behind.
+    for raw in lines:
+        stripped = raw.strip()
+        bare = stripped[1:].strip() if stripped.startswith(".") else stripped
+
+        if (in_authored and not region_closed and depth == 0
+                and _BATCH_EPILOGUE_RE.match(bare)):
+            # the child aborted here; everything after is batch scaffolding
+            break
+
+        if INTERNAL_BEGIN in bare:
+            depth += 1
+            continue
+        if INTERNAL_END in bare:
+            depth = max(0, depth - 1)
+            continue
+        if depth:
+            continue
+
+        if AUTHORED_BEGIN in bare:
+            seen_authored = True
+            in_authored = True
+            continue
+        if AUTHORED_END in bare:
+            in_authored = False
+            continue
+
+        if not seen_authored:
+            # Anything before the authored region is Stata's batch banner and
+            # helprun's own scaffolding.
+            continue
+
+        if not in_authored:
+            # Past the authored region: only the batch epilogue remains, and
+            # the ado prints the causal message and its code itself.
+            if _BATCH_EPILOGUE_RE.match(bare):
+                break
+            continue
+
+        # A bare echo of the graph hook, for a plan built before the internal
+        # fences existed or if a fence is ever lost.
+        if bare == GSNAP_CALL:
+            continue
+
+        out.append("" if stripped in (".", "") else raw)
+
     cleaned = []
     for line in out:
         if line == "" and cleaned and cleaned[-1] == "":
             continue
         cleaned.append(line)
 
-    return "\n".join(cleaned).strip("\n")
+    return chr(10).join(cleaned).strip(chr(10))
+
+
+def results_transcript(child_log):
+    """The authored region of a child log, fit for parent Results.
+
+    WHY THIS IS NOW A ONE-LINE DELEGATION
+
+    It used to be its own filter, stripping the AUTHORED markers and the graph
+    hook. When the persistent log gained a second, region-aware filter, the two
+    surfaces became two implementations of the same rule -- and they diverged
+    on the first change: the INTERNAL fences added for the log leaked straight
+    into Results, and a human watching a real click saw
+    `* HELPRUN-INTERNAL-BEGIN` echoed throughout. The report that one filter
+    already served both surfaces was wrong; only the log used it.
+
+    Section 12.1A wants Results to resemble ordinary interactive Stata: no
+    batch banner, no run-log header, no instrumentation, no duplicate streams.
+    That is exactly the property user_facing_transcript enforces, so this
+    function no longer has its own opinion about what to strip.
+    """
+    return user_facing_transcript(child_log)
 
 
 STATA_NOISE = (
@@ -5015,39 +6461,92 @@ STATA_NOISE = (
 
 
 def causal_stata_error(child_log):
-    """The meaningful Stata error, not merely `end of do-file`.
+    """The strongest evidence-backed Stata error, with its return code.
 
-    Stata prints the human-readable message immediately before its `r(NNN);`
-    line. Section 12.1A requires Results to show that causal message and code.
+    WHY THIS IS NOT A BACKWARD WALK FROM THE LAST r()
+
+    Stata's batch epilogue ends every failed run with `end of do-file` and a
+    final `r(NNN);`. The previous implementation started at that last `r()` and
+    walked back twelve lines for a message. Between the authored failure and
+    the epilogue sit helprun's own graph-capture postamble and Stata's echo of
+    it, so the window closed on nothing but echoes and the function returned an
+    empty message with a bare code. The caller then reported `end of do-file`,
+    or fell back to AMBIGUOUS_FAILURE_PROVENANCE, while the real cause --
+    `invalid 'nine'`, `is not a valid command name`, `file not found` -- sat
+    plainly in the log a little further up.
+
+    So the FIRST genuine failure is preferred instead of the last, because the
+    first is causal and everything after it is consequence, and the search is
+    not bounded by a fixed window that instrumentation can overflow. Internal
+    regions are skipped outright: a failure inside helprun's own instrumentation
+    is not the example's error and must never be reported as though it were.
+
+    AMBIGUOUS_FAILURE_PROVENANCE remains available to the caller, but only for
+    what it means: evidence that genuinely cannot attribute responsibility.
     """
     if not child_log:
         return "", ""
 
     lines = [l.rstrip() for l in child_log.splitlines()]
 
-    for i in range(len(lines) - 1, -1, -1):
-        m = re.match(r"^r\((\d+)\);\s*$", lines[i].strip())
-        if not m:
+    # Mark the internal regions so their content cannot be mistaken for the
+    # example's own failure.
+    internal = [False] * len(lines)
+    depth = 0
+    for i, line in enumerate(lines):
+        bare = line.strip()
+        if bare.startswith("."):
+            bare = bare[1:].strip()
+        if INTERNAL_BEGIN in bare:
+            depth += 1
+            internal[i] = True
             continue
+        if INTERNAL_END in bare:
+            internal[i] = True
+            depth = max(0, depth - 1)
+            continue
+        internal[i] = depth > 0
 
-        code = m.group(1)
-
-        # Walk back to the nearest non-empty, non-echo, non-noise line.
-        for j in range(i - 1, max(-1, i - 12), -1):
+    def message_before(index):
+        """The nearest real message above a return code."""
+        for j in range(index - 1, -1, -1):
+            if internal[j]:
+                continue
             candidate = lines[j].strip()
             if not candidate:
                 continue
             if candidate.startswith(". ") or candidate.startswith("> "):
+                # an echoed command: the failure text, if any, is above it
                 continue
             if candidate in STATA_NOISE:
                 continue
             if re.match(r"^r\(\d+\);$", candidate):
-                continue
-            return candidate, code
+                # reached the previous failure; this one has no message
+                return ""
+            if AUTHORED_BEGIN in candidate or AUTHORED_END in candidate:
+                return ""
+            return candidate
+        return ""
 
-        return "", code
+    fallback_code = ""
 
-    return "", ""
+    for i, line in enumerate(lines):
+        m = re.match(r"^r\((\d+)\);\s*$", line.strip())
+        if not m or internal[i]:
+            continue
+
+        code = m.group(1)
+        if code == "0":
+            continue
+
+        if not fallback_code:
+            fallback_code = code
+
+        message = message_before(i)
+        if message:
+            return message, code
+
+    return "", fallback_code
 
 
 # ============================================================
@@ -5066,11 +6565,52 @@ HELPRUN_INTERNAL_NAMES = {
 }
 
 
-def collect_authored_artifacts(sandbox, pre_existing):
-    """Files the example itself created that look like final artifacts.
+# Directories beneath the private TEMP that hold runtime machinery, never results:
+# caches, package/runtime installs, compiled or intermediate files.
+_RUNTIME_DIR_RE = re.compile(
+    r"^(?:.*cache.*|__pycache__|node_modules|jar|jars|lib|libs|pip|npm|hsperfdata.*|"
+    r"\.matplotlib|\.ipython|\.jupyter|site-packages|classes|build|dist|tmp\d*)$",
+    re.IGNORECASE)
+# Stata's own temporary files and generic scratch names.
+_SCRATCH_NAME_RE = re.compile(r"^(?:ST_[0-9a-z]+(?:\.\w+)?|.*\.tmp|~.*|\..*)$", re.IGNORECASE)
 
-    Temporary caches, runtime files and helprun's own plan/log files are never
-    exported (specification section 12.3).
+
+def _substantive_html(path):
+    """An HTML file that is a result page, not a redirect/loader stub or a
+    fragment: it has a document body with visible text, and is not a page whose
+    only purpose is to send the browser elsewhere (specification 12.3)."""
+    try:
+        if path.stat().st_size < 512:
+            return False
+        head = path.read_bytes()[:400000].decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    low = head.lower()
+    if "<body" not in low and "<svg" not in low:
+        return False
+    visible = re.sub(r"<script.*?</script>|<style.*?</style>|<[^>]+>", " ", head, flags=re.S | re.I)
+    visible = re.sub(r"\s+", " ", visible).strip()
+    if re.search(r"http-equiv\s*=\s*[\"']?refresh", low) and len(visible) < 200:
+        # a refresh page is a stub unless it also carries real content
+        return False
+    return len(visible) >= 80
+
+
+def collect_authored_artifacts(sandbox, pre_existing):
+    """Files the example, or a runtime it invoked, created as FINAL artifacts.
+
+    Classification is by nature and attribution, never by location or by
+    topic (specification 12.3, HPROD-49): a file beneath the run's private
+    TEMP -- where Java/Python/R/JavaScript runtimes legitimately write their
+    results -- is a final artifact when it carries an authored-output format,
+    is non-empty, is not a cache/runtime/scratch/intermediate file and (for
+    HTML) is a substantive document. Temporary caches, runtime files and
+    helprun's own plan/log files are never exported.
+
+    Returns [(path, normalize)] in creation order: `normalize` is True for a
+    file whose name the runtime chose as a temporary under TEMP -- it is
+    preserved under the run's identity name -- and False for a file the
+    example wrote by an authored name, which keeps that name.
     """
     found = []
     sandbox = Path(sandbox)
@@ -5081,8 +6621,6 @@ def collect_authored_artifacts(sandbox, pre_existing):
 
         rel = path.relative_to(sandbox)
 
-        if rel.parts and rel.parts[0] == "_tmp":
-            continue
         if rel.parts and rel.parts[0] == "_hr_out":
             continue
         if path.name in HELPRUN_INTERNAL_NAMES:
@@ -5092,9 +6630,33 @@ def collect_authored_artifacts(sandbox, pre_existing):
         if str(rel).lower() in pre_existing:
             continue
 
-        found.append(path)
+        in_temp = bool(rel.parts) and rel.parts[0] == "_tmp"
+        if in_temp:
+            # nature, not location: runtime machinery under TEMP is excluded
+            if any(_RUNTIME_DIR_RE.match(part) for part in rel.parts[1:-1]):
+                continue
+            if _SCRATCH_NAME_RE.match(path.name):
+                continue
+            try:
+                if path.stat().st_size == 0:
+                    continue
+            except OSError:
+                continue
+            if path.suffix.lower() in (".html", ".htm") and not _substantive_html(path):
+                continue
 
-    return found
+        found.append((path, in_temp))
+
+    # creation order for the runtime-named artifacts; authored names keep the
+    # existing sorted order after them
+    def order(item):
+        p, normalize = item
+        try:
+            return (0 if normalize else 1, p.stat().st_mtime if normalize else 0, str(p).lower())
+        except OSError:
+            return (1, 0, str(p).lower())
+
+    return sorted(found, key=order)
 
 
 # ============================================================
@@ -5158,6 +6720,12 @@ def runnable_units_for(source, roots):
         # that runs, and a control placed past it reads as belonging to that
         # section rather than to the example.
         unit["last_command_line"] = getattr(code, "last_command_line", None)
+        # Fragments the reconstruction could not justify. Carried onto the unit
+        # so click_run can refuse with a clear reason instead of feeding Stata
+        # a line that is not a command; `unit["code"]` is a plain list copy, so
+        # without this the finding would be dropped between here and the click.
+        unit["unreliable_fragments"] = list(
+            getattr(code, "unreliable_fragments", []))
         units.append(unit)
 
     for index, unit in enumerate(units, start=1):
@@ -5400,6 +6968,21 @@ def _write_run_log(out_dir, basename, sections):
     return log_path
 
 
+_ENGINE_IDENTITY = None
+
+
+def engine_identity():
+    """SHA-256 of this engine file, computed once."""
+    global _ENGINE_IDENTITY
+    if _ENGINE_IDENTITY is None:
+        try:
+            _ENGINE_IDENTITY = hashlib.sha256(
+                Path(__file__).read_bytes()).hexdigest()
+        except (OSError, NameError):
+            _ENGINE_IDENTITY = "unknown"
+    return _ENGINE_IDENTITY
+
+
 def _log_header(identity, target, plan, extra=()):
     lines = [
         "helprun " + HELPRUN_VERSION + " run log",
@@ -5416,13 +6999,18 @@ def _log_header(identity, target, plan, extra=()):
             or "none"
         ),
         "helprun version  : " + HELPRUN_VERSION,
+        # The engine identity, so a log says which build wrote it. Without it a
+        # validation scan cannot tell a log produced by the current engine from
+        # one left behind by an earlier build, and a corpus assertion over a
+        # directory of accumulated logs is either vacuous or permanently red.
+        "engine sha256    : " + engine_identity(),
     ]
     lines.extend(extra)
     lines.append("=" * 60)
     return lines
 
 
-def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
+def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=None):
     """Execute exactly the example the user clicked.
 
     `token` is the short content-addressed handle the Viewer's Run control
@@ -5453,6 +7041,11 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
     basename = ""
     target = None
     plan = []
+    # Header lines that must appear on EVERY path once known -- the
+    # INTERACTIVE line recording that the run paused for the user was written
+    # on the success path only, so a paused run that ended FAILED carried no
+    # evidence of its pause (HHARN-43).
+    header_extra = []
 
     def refuse(error, status=STATUS_REFUSED, extra_log=()):
         """Refuse cleanly, still leaving a diagnostic log when we can."""
@@ -5460,7 +7053,7 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
 
         if writable and basename:
             try:
-                sections = _log_header(identity, target or {}, plan)
+                sections = _log_header(identity, target or {}, plan, extra=header_extra)
                 sections.append("")
                 sections.append("STATUS      : " + status)
                 sections.append("FAILURE CLASS: " + error.failure_class)
@@ -5574,6 +7167,28 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
                     )
                 )
 
+            # A fragment the reconstruction could not read as a command, with
+            # nothing open above it to justify joining. Executing it would
+            # hand Stata a line that is not a command -- the r(199) `is not a
+            # valid command name` failure -- and joining it would be inventing
+            # the continuation the source does not supply. Section 5 permits
+            # reconstructing an authored continuation and forbids inventing a
+            # missing one, so neither is available: refuse, and say why.
+            fragments = unit.get("unreliable_fragments") or []
+            if fragments:
+                return refuse(
+                    HelprunError(
+                        "AMBIGUOUS_EXAMPLE_RECONSTRUCTION",
+                        "helprun: example "
+                        + str(unit["ordinal"])
+                        + " contains a line that cannot be read as a command "
+                        "and that nothing above it continues, so how it was "
+                        "meant to be joined cannot be determined without "
+                        "guessing",
+                        detail="fragment: " + redact_secrets(str(fragments[0]))[:160],
+                    )
+                )
+
         commands = []
         for unit in plan:
             commands.extend(unit["code"])
@@ -5588,6 +7203,12 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
             "roots": roots,
             "out_dir": out_dir,
             "sandbox": None,
+            # The working directory the user was in when they clicked. A
+            # relative authored input such as `use example_data.dta` resolves
+            # against it in the parent session, and resolving it is the whole
+            # point of isolating execution somewhere else: moving the run into
+            # a sandbox must not make a legitimate input disappear.
+            "parent_pwd": parent_root,
         }
 
         # Preflight: a Stata version the installation cannot provide is known
@@ -5629,6 +7250,87 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
                 )
             )
 
+        # Interactive input inside the authored programs (HPROD-42). Decided
+        # BEFORE execution from the programs' own source. Such an example runs
+        # in a visible Stata that helprun launches and owns, where the user
+        # answers the example's prompt by hand; helprun itself never answers.
+        needs_input = interactive_requirements(commands, roots)
+        worker = None
+        trace_commands = ()
+
+        if needs_input:
+            trace_commands = tuple(n["command"] for n in needs_input)
+            title = worker_window_title(str(identity.get("topic", "")),
+                                        target["ordinal"])
+
+            def _tell(text):
+                try:
+                    from sfi import SFIToolkit
+                    SFIToolkit.displayln(text, asis=True)
+                except Exception:
+                    pass
+
+            # Every requirement must be a line the user can type (an _request()
+            # or a pause prompt); a modal dialog cannot be relayed and takes the
+            # visible route with the minimum user action (HPROD-48).
+            relayable = all(n.get("primitive") in ("_request()", "pause") for n in needs_input)
+
+            def _parent_ask(info):
+                """Present the authored output and prompt in the PARENT and read
+                one line there through Stata's own _request (GATE 2 R23)."""
+                from sfi import SFIToolkit, Macro
+                for line in (info.get("transcript") or "").splitlines():
+                    if line.strip():
+                        SFIToolkit.displayln(line, asis=True)
+                kind = info.get("class")
+                if kind == PROMPT_ENTER_ONLY:
+                    _tell("helprun: the example is waiting for you -- press Enter in this "
+                          "Command window to continue")
+                elif kind == PROMPT_YES_NO:
+                    _tell("helprun: the example is waiting for you -- type y or n in this "
+                          "Command window and press Enter")
+                else:
+                    _tell("helprun: the example is waiting for you -- type your answer in "
+                          "this Command window and press Enter")
+                SFIToolkit.stata('global HELPRUN_ANSWER ""')
+                try:
+                    SFIToolkit.stata("display _request(HELPRUN_ANSWER)")
+                except Exception:
+                    raise InteractionCancelled()
+                answer = Macro.getGlobal("HELPRUN_ANSWER") or ""
+                try:
+                    SFIToolkit.stata("macro drop HELPRUN_ANSWER")
+                except Exception:
+                    pass
+                return answer
+
+            # Unattended runs (validation, or a bounded wait configured) never
+            # ask the parent: _request there would block for a line nobody
+            # types. They receive answers from a hook, or report the prompt.
+            unattended = (os.environ.get("HELPRUN_UNATTENDED", "") == "1"
+                          or bool(os.environ.get("HELPRUN_INPUT_WAIT_SECONDS", "").strip()))
+            if ask is None and stata_available() and not unattended:
+                ask = _parent_ask
+
+            # A requirement that is not a typed line (a modal dialog) needs the
+            # worker VISIBLE from the start: a hidden Stata does not show the
+            # dialog and lets the program continue as if answered (R25), which
+            # would change the authored semantics. Everything else starts
+            # hidden and is revealed only if a relay cannot be delivered.
+            worker = {
+                "title": title,
+                "ask": ask,
+                "relayable": relayable,
+                "visible": not relayable,
+                "on_start": (None if relayable else lambda pid: _tell(
+                    "helprun: this example asks through a dialog that cannot be answered "
+                    "here, so it is running in a separate Stata window titled \"" + title
+                    + "\"; its output appears there, and here when it finishes")),
+                "on_pause": lambda: _tell(
+                    "helprun: the example is waiting for you -- this question cannot be "
+                    "answered here; answer it in the Stata window titled \"" + title + "\""),
+            }
+
         # Runtime and safety policy, by role and provenance.
         decisions, blocking = guard_plan(commands, ctx)
 
@@ -5664,7 +7366,8 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
             )
 
         # Dataset resolution, with no fuzzy filename substitution.
-        _staged, data_problem = resolve_data_references(commands, ctx, unit_lines)
+        staged_inputs, data_problem = resolve_data_references(
+            commands, ctx, unit_lines)
 
         if data_problem is not None:
             return refuse(data_problem)
@@ -5691,7 +7394,14 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
             roots=roots,
             timeout_seconds=timeout_seconds,
             capture={"basename": basename},
+            staged_inputs=staged_inputs,
+            worker=worker,
+            trace_commands=trace_commands,
         )
+
+        interactive_evidence = result.get("interactive")
+        header_extra.extend(interactive_header_lines(interactive_evidence))
+        streamed_lines = list((interactive_evidence or {}).get("streamed_lines") or [])
 
         child_log = ""
         if result.get("logfile"):
@@ -5746,11 +7456,21 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
 
                 error = HelprunError(reason, message)
 
+            # Artifacts the authored commands created before the failure are
+            # final outputs too (specification 12.3, HPROD-49): preserved and
+            # verified BEFORE the log is written and the sandbox removed.
+            artifacts, not_exported = _export_artifacts(result, out_dir, basename)
             outcome = refuse(
                 error,
                 status=STATUS_FAILED,
-                extra_log=["", "CHILD OUTPUT", "-" * 60, child_log],
+                extra_log=["", "OUTPUT", "-" * 60,
+                           user_facing_transcript(child_log), "",
+                           "ARTIFACTS   : " + (", ".join(Path(a).name for a in artifacts) or "none")]
+                          + (["ARTIFACTS NOT EXPORTED: " + ", ".join(not_exported)
+                              + " -- sandbox kept: " + str(result.get("sandbox", ""))]
+                             if not_exported else []),
             )
+            outcome["artifacts"] = [str(a) for a in artifacts]
             outcome["child_output"] = child_log
             outcome["sandbox"] = result.get("sandbox", "")
             outcome["temp_root"] = result.get("temp_root", "")
@@ -5758,30 +7478,47 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
             outcome["r_codes"] = result.get("r_codes", [])
             outcome["segments"] = result.get("segments", 0)
             outcome["child_pids"] = result.get("child_pids", [])
+            outcome["interactive"] = interactive_evidence
+            outcome["streamed_lines"] = streamed_lines
 
-            # The diagnostic log is already written, so the sandbox can go.
-            _cleanup_sandbox(result.get("sandbox"))
+            # The diagnostic log and the artifacts are written, so the sandbox
+            # can go -- unless an identified artifact could not be preserved
+            # (HPROD-50: cleanup never destroys the only required copy).
+            if not not_exported:
+                _cleanup_sandbox(result.get("sandbox"))
             return outcome
 
-        # Success: export verified artifacts to the frozen output directory.
-        artifacts = _export_artifacts(result, out_dir, basename)
-        _cleanup_sandbox(result.get("sandbox"))
+        # Success: export verified artifacts to the frozen output directory,
+        # then remove the sandbox -- kept if an artifact could not be preserved.
+        artifacts, not_exported = _export_artifacts(result, out_dir, basename)
+        if not not_exported:
+            _cleanup_sandbox(result.get("sandbox"))
 
         sections = _log_header(identity, target, plan)
+        # Evidence that the example paused for the user, what it asked, what
+        # was relayed and that it resumed: kept in the header because the
+        # trace that showed it is stripped from every user-facing surface.
+        sections.extend(interactive_header_lines(interactive_evidence))
         sections.append("")
         sections.append("STATUS      : " + STATUS_SUCCESS)
         sections.append("COMMANDS EXECUTED")
         sections.append("-" * 60)
         sections.extend(redact_secrets(c) for c in commands)
         sections.append("")
-        sections.append("CHILD OUTPUT")
+        # The user-facing log carries the clean transcript. The raw child
+        # output is returned on the outcome as `child_output` for internal,
+        # debug and validation use; it is not what a user opens.
+        sections.append("OUTPUT")
         sections.append("-" * 60)
-        sections.append(child_log)
+        sections.append(user_facing_transcript(child_log))
         sections.append("")
         sections.append(
             "ARTIFACTS   : "
             + (", ".join(Path(a).name for a in artifacts) or "none")
         )
+        if not_exported:
+            sections.append("ARTIFACTS NOT EXPORTED: " + ", ".join(not_exported)
+                            + " -- sandbox kept: " + str(result.get("sandbox", "")))
 
         log_path = _write_run_log(out_dir, basename, sections)
 
@@ -5802,6 +7539,8 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90):
             child_temp=result.get("child_temp", ""),
             r_codes=result.get("r_codes", []),
             segments=result.get("segments", 0),
+            interactive=interactive_evidence,
+            streamed_lines=streamed_lines,
         )
 
     except HelprunError as exc:
@@ -5829,13 +7568,36 @@ def _cleanup_sandbox(sandbox):
     return True
 
 
+def _copy_verified(path, destination):
+    """Copy one artifact and verify the copy's size against the source; a copy
+    that does not verify is removed. Returns True only for a verified copy."""
+    try:
+        shutil.copyfile(path, destination)
+        if destination.stat().st_size != path.stat().st_size:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            return False
+        return True
+    except OSError:
+        return False
+
+
 def _export_artifacts(result, out_dir, basename):
-    """Copy verified final artifacts out of the sandbox, never the whole tree."""
+    """Copy verified final artifacts out of the sandbox, never the whole tree.
+
+    Called on EVERY path (SUCCESS and FAILED) before the sandbox is removed
+    (HPROD-49/50). Returns (exported, failed): `failed` names artifacts that
+    were identified but could not be preserved -- the caller then keeps the
+    sandbox rather than destroy the only copy.
+    """
     exported = []
+    failed = []
 
     sandbox = result.get("sandbox")
     if not sandbox:
-        return exported
+        return exported, failed
 
     sandbox = Path(sandbox)
     capture_dir = sandbox / "_hr_out"
@@ -5847,30 +7609,36 @@ def _export_artifacts(result, out_dir, basename):
             destination = Path(out_dir) / path.name
             if destination.exists():
                 continue
-            try:
-                shutil.copyfile(path, destination)
+            if _copy_verified(path, destination):
                 exported.append(destination)
-            except OSError:
-                pass
+            else:
+                failed.append(path.name)
 
-    for path in collect_authored_artifacts(
+    ordinal = 0
+    for path, normalize in collect_authored_artifacts(
         sandbox, result.get("pre_existing", set())
     ):
-        destination = Path(out_dir) / path.name
+        if normalize:
+            # a runtime-named temporary is preserved under the run's identity,
+            # numbered in creation order (specification 12.3)
+            ordinal += 1
+            destination = Path(out_dir) / ("%s-artifact-%d%s" % (basename, ordinal, path.suffix.lower()))
+            if destination.exists():
+                failed.append(path.name)
+                continue
+        else:
+            destination = Path(out_dir) / path.name
+            if destination.exists():
+                destination = Path(out_dir) / (basename + "-" + path.name)
+            if destination.exists():
+                continue
 
-        if destination.exists():
-            destination = Path(out_dir) / (basename + "-" + path.name)
-
-        if destination.exists():
-            continue
-
-        try:
-            shutil.copyfile(path, destination)
+        if _copy_verified(path, destination):
             exported.append(destination)
-        except OSError:
-            pass
+        else:
+            failed.append(path.name)
 
-    return exported
+    return exported, failed
 
 
 def _flatten_for_ado(result):
@@ -5919,6 +7687,9 @@ def ado_click(token, parent_pwd, roots):
     outcome = run_public(token, parent_pwd, roots)
 
     transcript = results_transcript(outcome.get("child_output", ""))
+    # What the parent already showed while relaying prompts is not shown again
+    # (HPROD-48): the final transcript starts after the streamed prefix.
+    transcript = strip_streamed_prefix(transcript, outcome.get("streamed_lines") or [])
 
     # On failure, prefer the meaningful causal Stata message over the
     # `end of do-file` noise the batch log ends with.
@@ -5953,6 +7724,10 @@ def ado_click(token, parent_pwd, roots):
 
     # The raw child transcript must not travel through a Stata macro.
     outcome.pop("child_output", None)
+    # structured interactive evidence is for the log header and validation,
+    # not for Stata locals
+    outcome.pop("interactive", None)
+    outcome.pop("streamed_lines", None)
 
     return _flatten_for_ado(outcome)
 

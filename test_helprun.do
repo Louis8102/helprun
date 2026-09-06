@@ -76,11 +76,32 @@ local RUNDIR  "`PROJECT'\validation\gate3_run"
 * environment variable in a sub-process.
 global HELPRUN_PROJECT `"`PROJECT'"'
 
+* Environment row (HHARN-35). helprun depends on Stata's Python integration
+* through the PERMANENT python_exec preference; an elevated Stata run once
+* dropped it and nothing noticed until the next click failed. Checked BEFORE
+* this file's own first python block, so a machine whose preference is missing
+* gets a FAIL row (ENV-PYTHON) instead of a python error somewhere unrelated.
+do "`PROJECT'\validation\env_check.do"
+* External-UI containment (HHARN-41): this run is unattended; snapshot the browser
+* tab strips ONCE, here, before any example executes. (It lived in env_check.do
+* first, which interactive_contract.do also runs, so the rows file was reset
+* mid-suite; a snapshot taken twice cannot attribute the pages between them.)
+python: import os; os.environ["HELPRUN_UNATTENDED"] = "1"
+python script "`PROJECT'\tests\external_ui.py", args(--snapshot suite)
+
+
 python:
 import os
 from sfi import Macro
 os.environ["HELPRUN_PROJECT"] = Macro.getGlobal("HELPRUN_PROJECT")
 end
+
+* Unattended run: an example whose program asks the user for input runs in a
+* visible worker (HPROD-42); nobody is here to answer, so the wait is bounded
+* and such a run is reported as not answered, never SUCCESS. Production leaves
+* the wait unbounded (the resumable human-input state).
+python: import os; os.environ["HELPRUN_INPUT_WAIT_SECONDS"] = "45"
+
 
 * ------------------------------------------------------------------
 * Locate the Stata executable for the GUI sub-runs, without hard-coding it.
@@ -349,6 +370,42 @@ di as txt "Defect intake and change control"
 di as txt "{hline 78}"
 python script "`PROJECT'\tests\incident_intake.py"
 python script "`PROJECT'\tests\run_entrypoints.py"
+
+* ------------------------------------------------------------------
+* Interactive-input contract (HPROD-42, remainder of HPROD-34) and the
+* nine-topic general-rule audit. Both run their own launchers so the roots
+* come from this process's sysdir and the renamed fixture programs are on
+* the adopath; neither launcher exits Stata.
+* ------------------------------------------------------------------
+di as txt ""
+di as txt "{hline 78}"
+di as txt "Interactive-input contract and nine-topic general-rule audit"
+di as txt "{hline 78}"
+do "`PROJECT'\validation\interactive_contract.do"
+do "`PROJECT'\validation\nine_topic_audit.do"
+do "`PROJECT'\validation\external_ui_contract.do"
+* Final-artifact preservation and lifecycle contract (HPROD-49/50, HHARN-51):
+* renamed external-runtime-like fixtures plus the real sparkta anchor.
+do "`PROJECT'\validation\artifact_contract.do"
+do "`PROJECT'\validation\manual_dependencies.do" check viewer
+
+
+* ------------------------------------------------------------------
+* User-facing log contract.
+*
+* helprun 1.0.0 shipped the raw child transcript inside the log a user
+* opens. The clean-output assertions read parent Results and never opened
+* the log, so the surface users actually read was never asserted on.
+* ------------------------------------------------------------------
+di as txt ""
+di as txt "{hline 78}"
+di as txt "User-facing log contract"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\user_log_contract.py"
+python script "`PROJECT'\tests\planner_contract.py"
+python script "`PROJECT'\tests\parser_contract.py"
+python script "`PROJECT'\tests\input_staging_contract.py"
+python script "`PROJECT'\tests\diagnostic_contract.py"
 
 di as txt ""
 di as txt "{hline 78}"
