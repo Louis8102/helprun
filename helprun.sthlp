@@ -1,5 +1,5 @@
 {smcl}
-{* *! version 1.0.0 03sep2026}{...}
+{* *! version 1.0.0 06sep2026}{...}
 {vieweralsosee "help" "help help"}{...}
 {vieweralsosee "view" "help view"}{...}
 {vieweralsosee "python" "help python"}{...}
@@ -7,59 +7,23 @@
 {title:Title}
 
 {phang}
-{bf:helprun} {hline 2} Run a complete Stata help example by clicking it in the Viewer{p_end}
+{bf:helprun} {hline 2} Run code examples from official and user-written Stata help files by clicking in the Viewer{p_end}
 
 {title:Description}
 
 {pstd}
-{cmd:helprun} lets you run the examples you are reading in a Stata help file
-without copying anything into the Do-file Editor. Open any help topic, type
-{cmd:helprun}, and a temporary copy of that help page appears with a
-{bf:Run this example} control beside each complete example. Click the one you
-want and it runs.{p_end}
-
-{pstd}
-The help file you are reading is never modified, and the example never runs in
-your session. Each click runs in a separate hidden Stata, so your data, your
-results and your working directory are left exactly as they were.{p_end}
-
-{pstd}
-Each click saves its output. {cmd:helprun} creates a directory named for the
-help topic beneath your current working directory and writes the run log there,
-together with any graphs the example produced and any file it clearly set out
-to create. Existing files are never overwritten: a second run of the same
-example is saved alongside the first under a {cmd:-run-2} name. After the run,
-Results prints one line naming that directory:{p_end}
-
-{pstd}{bf:helprun: log and other output files saved in} {it:directory}{p_end}
+{cmd:helprun} lets you run a code example from a Stata help file without copying it into the Do-file Editor. The example runs outside your interactive session, and its log, code, output files, and a run summary are saved automatically beneath the current Stata working directory.{p_end}
 
 {title:Why use helprun?}
 
 {pstd}
-A Stata help example may contain setup code, data-loading steps, multiline
-commands, loops, links, or code spread across help content. {cmd:helprun}
-reconstructs the complete example for you, runs it only after you click
-{bf:Run this example}, returns the result to Stata, and reports a clear
-reason when the example cannot be reproduced as written.{p_end}
+Help-file examples can be long and inconvenient to copy and run manually. Many also finish without preserving the code or output. {cmd:helprun} makes the example easier to execute and keeps the resulting run materials together for later review and reuse.{p_end}
 
 {title:Key features}
 
-{p 4 8 2}• {bf:One-click complete examples.} Run a complete example directly
-from the Viewer across official Stata help and installed user-written help,
-without copying code into the Do-file Editor.{p_end}
-
-{p 4 8 2}• {bf:Protected execution with clear diagnostics.} Run examples
-outside the interactive parent session; when required data, runtime
-components, or other prerequisites are unavailable, {cmd:helprun} explains
-what prevented the run instead of substituting or guessing.{p_end}
-
-{p 4 8 2}• {bf:Automatic output preservation.} Return run output to Results
-and save {it:topic}-example-{it:N}.log in the working directory current when
-the example is clicked. Capturable Stata graphs are preserved as .gph and
-.png; clearly authored final outputs can include .dta, .csv, .xlsx, .docx,
-.pdf, .tex, .html, and .svg. Existing files are not overwritten; when needed,
-{cmd:-run-2}, {cmd:-run-3}, and later suffixes are used for the saved
-run.{p_end}
+{p 4 8 2}• {bf:Run this example.} Open a help topic, type {cmd:helprun}, and click the desired example in the temporary Viewer.{p_end}
+{p 4 8 2}• {bf:Reconstruct.} {cmd:helprun} preserves authored command order and adds only setup that is required and supported by evidence.{p_end}
+{p 4 8 2}• {bf:Isolate.} The selected example runs outside the interactive dataset; ambiguous or unsupported execution is refused rather than guessed.{p_end}
 
 {title:Syntax}
 
@@ -77,15 +41,26 @@ run.{p_end}
 Typing {cmd:helprun} only prepares the clickable view. Nothing is executed,
 downloaded or installed until you click a specific example.{p_end}
 
+{pstd}After each run, Results reports the directory where the run files were saved. Existing files are not overwritten; repeated runs use {cmd:-run-2}, {cmd:-run-3}, and later suffixes.{p_end}
+
 {title:Practical applications}
 
 {pstd}
 The examples below are real topics on a system where {cmd:helprun} has been
-tested. They show an ordinary official help topic, a third-party topic whose
-example is written as native clickable commands, and a topic whose example
-cannot run because the help file supplies no data.{p_end}
+tested. They show a long third-party example that creates multiple output
+files, an ordinary official Stata help topic, a third-party topic written as
+native clickable commands, and a topic whose example cannot run because the
+help file supplies no data.{p_end}
 
-{title:Example 1. Running an official Stata help example}
+{title:Example 1. Running a long nestpreserve example with multiple saved outputs}
+
+{p 4 4 2}{cmd:help nestpreserve}{p_end}
+{p 4 4 2}{cmd:helprun}{p_end}
+{pstd}Click the "Run this example" icon for Example 4.{p_end}
+
+{pstd}Example 4 downloads county homicide data, performs a multi-part spatial and temporal analysis, and creates several output files. A successful run includes {cmd:County_Homicide_Rates_1960_1990.pdf}, {cmd:County_Homicide_Rates_1960_1990.png}, {cmd:Average_County_Homicide_Rate_Trend.pdf}, {cmd:Average_County_Homicide_Rate_Trend.png}, and the downloaded data files. {cmd:helprun} also saves the run materials and preserves capturable Stata graphs as .gph and .png files in the {cmd:nestpreserve} directory beneath the current Stata working directory. Existing files are not overwritten; repeated runs use {cmd:-run-2}, {cmd:-run-3}, and later suffixes.{p_end}
+
+{title:Example 2. Running an official Stata help example}
 
 {p 4 4 2}{cmd:help regress}{p_end}
 {p 4 4 2}{cmd:helprun}{p_end}
@@ -98,11 +73,11 @@ models. Results shows the commands and their output as if you had typed them,
 and the run is saved in a {cmd:regress} directory beneath your working
 directory.{p_end}
 
-{title:Example 2. Running a third-party example written as clickable commands}
+{title:Example 3. Running a third-party example written as clickable commands}
 
 {p 4 4 2}{cmd:help reg2docx}{p_end}
 {p 4 4 2}{cmd:helprun}{p_end}
-{pstd}Click the "Run this example" icon for Example 1.{p_end}
+{pstd}Click the "Run this example" icon for Example.{p_end}
 
 {pstd}
 This help page writes its whole example as a long sequence of individually
@@ -111,44 +86,31 @@ wrote them; {cmd:helprun} simply adds one control that runs the example as a
 single unit, in the authored order, rather than making you click twenty-four
 commands one at a time.{p_end}
 
-{title:Example 3. An example the help file cannot supply data for}
+{title:Example 4. Running an example that requires user confirmation}
+
+{p 4 4 2}{cmd:help varorder}{p_end}
+{p 4 4 2}{cmd:helprun}{p_end}
+{pstd}Click the "Run this example" icon for Example 1.{p_end}
+
+{pstd}When {cmd:varorder_example_data.dta} is available in the working directory, the {cmd:varorder} example displays a preview and asks the user to press Enter before applying the proposed variable ordering. The prompt appears in Results, and the user answers in the Command window; {cmd:helprun} never answers automatically.{p_end}
+
+{title:Example 5. Running an example that does not provide the required data}
 
 {p 4 4 2}{cmd:help minvar}{p_end}
 {p 4 4 2}{cmd:helprun}{p_end}
 {pstd}Click the "Run this example" icon for Example 1.{p_end}
 
-{pstd}
-The {cmd:minvar} help page shows its command applied to variables such as
-{cmd:anx1_1} and {cmd:anx2_1}, but the page never loads a dataset and never
-generates one, so there is nothing for the example to run against. Rather than
-inventing data or reporting an obscure error, {cmd:helprun} says so:{p_end}
-
-{pstd}{bf:helprun: this example does not provide a runnable dataset or data setup.}{p_end}
-
-{pstd}
-A diagnostic log is still written to the {cmd:minvar} directory, and the
-location is printed in Results. This is the expected outcome for an example
-that documents a command's syntax without providing data, and it is not a
-failure of the help file or of your setup.{p_end}
+{pstd}The {cmd:minvar} help example does not provide the required data. Therefore, when the example is run, {cmd:helprun} reports: {bf:helprun: this example does not provide a runnable dataset or data setup.}{p_end}
 
 {title:Compatibility}
 
-{pstd}
-{cmd:helprun} requires Stata 16 or later.{p_end}
+{pstd}{cmd:helprun} requires Stata 16 or later with Stata's Python integration enabled. Release validation was performed on Windows 10 with StataNow 19.5.{p_end}
 
 {pstd}
-That requirement follows from Stata frames, which {cmd:helprun} uses and
-which were introduced in Stata 16. Release validation was carried out on
-Windows 10 with StataNow 19.5 and Stata's Python integration available
-({cmd:python query}). Stata 16 through 18 are supported but were not part of
-that validation, and other platforms are not validated.{p_end}
+{cmd:helprun} is {bf:not} a malware sandbox. Its isolation is for the Stata data/session boundary; it does not sandbox the host computer from commands authored by an example. Installing or configuring software is never done silently by {cmd:helprun}; such actions can occur only when they are explicitly authored by the example being run.{p_end}
 
 {pstd}
-Each example runs in a separate hidden Stata, so your session is protected,
-but {cmd:helprun} is {bf:not} a malware sandbox and makes no security
-guarantee about code an author wrote. Installing or downloading anything on
-your behalf is never done silently: whatever would change your Stata
-installation is described first and needs your confirmation.{p_end}
+Compatibility beyond the platforms and Stata releases covered by this release's validation is not validated.{p_end}
 
 {title:Version}
 
@@ -166,14 +128,7 @@ Email: {browse "mailto:shouhuoxiwang2027@gmail.com":shouhuoxiwang2027@gmail.com}
 {title:Suggested citation}
 
 {pstd}
-If you use {cmd:helprun} in research, please cite the software as: Ma, H.
-(2026). helprun: Run complete Stata help examples with a single click in the
-Viewer. Version 1.0.0. Available at
-{browse "https://github.com/Louis8102/helprun":https://github.com/Louis8102/helprun}.{p_end}
-
-{pstd}
-The SSC component identifier will be added to this citation once it has been
-officially assigned.{p_end}
+Ma, H. (2026). helprun: Run code examples from official and user-written Stata help files by clicking in the Viewer. Version 1.0.0.{p_end}
 
 {title:License}
 

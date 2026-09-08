@@ -87,7 +87,76 @@ do "`PROJECT'\validation\env_check.do"
 * first, which interactive_contract.do also runs, so the rows file was reset
 * mid-suite; a snapshot taken twice cannot attribute the pages between them.)
 python: import os; os.environ["HELPRUN_UNATTENDED"] = "1"
+
+* ------------------------------------------------------------------
+* Clear any browser page a PREVIOUS run left open (HHARN-62), BEFORE the
+* baseline snapshot below, so the baseline describes a clean desktop.
+*
+* The end-of-suite residue check can only run if the suite reaches its end, and
+* when Stata's access violation ends a run part way through it never does: a
+* stage killed mid-run cannot close its own pages, and a guard living inside
+* the process that dies is no guard. Five consecutive runs on 2026-09-06 ended
+* that way, the end-of-suite check never executed once, and four pages were
+* left on the user's desktop with no containment record naming them.
+*
+* So the next run cleans up after the last one. This is recovery, not a
+* verdict: it closes only what it can attribute to a document this project
+* produced, leaves every other tab alone, and always succeeds. The
+* end-of-suite check is the one that judges.
+* ------------------------------------------------------------------
+python script "`PROJECT'\tests\external_ui.py", args(--sweep)
+
+* ------------------------------------------------------------------
+* BROWSER-EXCLUSIVITY PRECONDITION (HHARN-68; user decision 2026-09-07).
+*
+* A release-candidate run requires that no browser window is open when it
+* starts and that none is opened while it runs. This is a precondition of the
+* RUN, not a relaxation of the attribution rule: page ownership is still
+* established only by matching a page against a document helprun recorded,
+* HHARN-64 still forbids treating unmatched newly appeared pages as clean, and
+* nothing here infers ownership from a title.
+*
+* Why a precondition rather than smarter matching: attribution is negative, so
+* a page a person opens by hand can never match a recorded document and is
+* permanently unresolvable. Two suite runs on 2026-09-06 passed with
+* appeared=12 attributable=12 and a third read UNRESOLVED on a Google tab and
+* a Statalist thread, on identical code. Positive URL/path attribution is the
+* real answer and is deferred to post-1.0 by the same decision.
+*
+* The check REFUSES and never closes: the sweep above has already closed what
+* this project can prove it produced, so anything still open belongs to the
+* user or cannot be proved ours, and in both cases the harness must stop and
+* say so rather than decide what the user may have open.
+* ------------------------------------------------------------------
+capture noisily python script "`PROJECT'\tests\external_ui.py", args(--preflight)
+if _rc {
+    di as err ""
+    di as err "helprun: master validation suite NOT STARTED."
+    di as err "The browser-exclusivity precondition for a release-candidate run"
+    di as err "is not satisfied. Close all browser windows and run this file"
+    di as err "again; do not open a browser while it runs. Nothing was closed"
+    di as err "for you, and no validation state was changed."
+    exit 459
+}
+
 python script "`PROJECT'\tests\external_ui.py", args(--snapshot suite)
+
+* ------------------------------------------------------------------
+* This run's own completion record (HHARN-60).
+*
+* StataMp-64.exe takes an access violation at a fixed fault offset -- 24 times
+* over the six days to 2026-09-06, on days before this session as well as
+* during it -- and when it hits the suite's own process the run stops part way
+* through, exits 0, and loses its buffered log. Every results file is then
+* still present and green from an earlier run, so an abandoned run looked
+* exactly like a finished one.
+*
+* The harness cannot stop Stata crashing. It can refuse to let an unfinished
+* run pass for a finished one: this records that a run is in progress, and the
+* matching call at the very end records that it completed. A run that dies
+* leaves the first state behind and the terminal audit refuses it.
+* ------------------------------------------------------------------
+python script "`PROJECT'\tests\suite_record.py", args(--begin)
 
 
 python:
@@ -387,6 +456,16 @@ do "`PROJECT'\validation\external_ui_contract.do"
 * Final-artifact preservation and lifecycle contract (HPROD-49/50, HHARN-51):
 * renamed external-runtime-like fixtures plus the real sparkta anchor.
 do "`PROJECT'\validation\artifact_contract.do"
+* Persistent example code artifact, standalone .do and run manifest
+* (specification 12.4, scope decision SCOPE-002). It executes real examples, so
+* it belongs here, ahead of the end-of-suite residue check.
+do "`PROJECT'\validation\code_artifact.do"
+* Segmentation, source faithfulness and public-surface provenance: three
+* contracts written for the corrections of 2026-09-06, run here rather than
+* separately so the master entry point is the only thing a user must launch.
+python script "`PROJECT'\tests\segmentation.py"
+python script "`PROJECT'\tests\source_faithfulness.py"
+python script "`PROJECT'\tests\public_surface.py"
 do "`PROJECT'\validation\manual_dependencies.do" check viewer
 
 
@@ -478,6 +557,25 @@ else {
     di as txt ""
     di as txt "Corpus skipped (HELPRUN_SKIP_CORPUS=1). Not valid for a release candidate."
 }
+
+* ------------------------------------------------------------------
+* External-UI residue, at the TRUE end of the suite (EXTUI-08, HHARN-58/59).
+*
+* A stage that opens browser pages owns them, and its own containment report is
+* not sufficient evidence: two stages reported closed=3 remaining=0 on
+* 2026-09-06 with pages still open, because both numbers come from the same tab
+* matching that had failed. This asserts from the desktop instead, and it must
+* run LAST -- placed at the external-UI stage it would inspect a desktop that
+* the artifact and code-artifact stages then dirty.
+* ------------------------------------------------------------------
+di as txt ""
+di as txt "{hline 78}"
+di as txt "External-UI residue (whole suite)"
+di as txt "{hline 78}"
+python script "`PROJECT'\tests\external_ui.py", args(--residue)
+
+* The completion record, written only if the suite actually reached here.
+python script "`PROJECT'\tests\suite_record.py", args(--end)
 
 di as txt "{hline 78}"
 di as txt "Master validation suite complete."

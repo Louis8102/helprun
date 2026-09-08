@@ -279,6 +279,7 @@ REASON_CLASS = {
     "USER_INTERACTION_REQUIRED": CLASS_EXECUTION,
     "INTERACTIVE_INPUT_REQUIRED": CLASS_EXECUTION,
     "HELPRUN_BUSY": CLASS_EXECUTION,
+    "EXAMPLE_CONTINUES_EARLIER_EXAMPLE": CLASS_EXECUTION,
     "AMBIGUOUS_FAILURE_PROVENANCE": CLASS_EXECUTION,
     # OUTPUT
     "OUTPUT_DIRECTORY_NOT_WRITABLE": CLASS_OUTPUT,
@@ -582,9 +583,15 @@ def choose_run_basename(out_dir, topic, ordinal):
     for candidate in _basename_candidates(topic, ordinal):
         prefix = candidate.lower()
 
+        # Any file already carrying this basename takes it, whatever suffix it
+        # wears: the log, a graph, an exported artifact, the code record, the
+        # standalone do-file or the manifest. Listing the suffixes one by one
+        # meant each new kind of run file had to remember to add itself, and a
+        # kind that forgot could let a second run claim a basename already in
+        # use and detach a file from the run that produced it.
         collides = any(
             name == prefix or name.startswith(prefix + ".")
-            or name.startswith(prefix + "-graph-")
+            or name.startswith(prefix + "-")
             for name in existing
         )
 
@@ -1763,6 +1770,24 @@ EXAMPLES_CONTAINER_EXACT = {
     "remarks/examples",
 }
 
+# A section title that OPENS with one of these names the kind of section it is,
+# so a later "examples" in it belongs to the subject rather than to the section.
+# base/d/duplicates.sthlp titles a section
+#
+#     {title:Options for duplicates examples and duplicates list}
+#
+# where "examples" is part of the subcommand name `duplicates examples`. Reading
+# that as an Examples section offered the option syntax as a runnable example.
+#
+# The list is deliberately short and leading-position only: "Remarks and
+# examples" is a genuine container and must keep working, so a title is excluded
+# only when its FIRST word already declares a different section kind.
+_NON_EXAMPLE_TITLE_LEAD_RE = re.compile(
+    r"^(?:options?|syntax|stored\s+results|also\s+see|acknowledge?ments?|"
+    r"references?|authors?)\b",
+    flags=re.IGNORECASE,
+)
+
 
 def examples_container(raw):
     """Is this {title:...} a section that CONTAINS examples?
@@ -1796,6 +1821,9 @@ def examples_container(raw):
 
     if low in EXAMPLES_CONTAINER_EXACT:
         return True
+
+    if _NON_EXAMPLE_TITLE_LEAD_RE.match(low):
+        return False
 
     return bool(re.search(r"\bexamples?\b", low))
 
@@ -1991,6 +2019,47 @@ def peer_structural_boundary(raw):
     )
 
 
+# A dialog-tab sub-heading.  Stata renders {dlgtab:...} as a shaded, labelled
+# full-width divider -- a structural directive the renderer draws, not prose
+# that happens to look like a caption.  The optional {marker}/{...} prefix is
+# how installed help usually anchors one.
+_DIALOG_TAB_RE = re.compile(
+    r"^\s*(?:\{marker\s+[^}]*\}\s*)?(?:\{\.\.\.\}\s*)?"
+    r"\{dlgtab(?::\s*|\s+)(.*?)\s*\}\s*(?:\{\.\.\.\}\s*)?$",
+    flags=re.IGNORECASE,
+)
+
+
+def dialog_tab_heading(raw):
+    """The label of a {dlgtab:...} sub-heading line, or None.
+
+    {dlgtab:...} is a strong structural boundary: unlike an ordinary {pstd}
+    caption, which is just paragraph text an author may use for any purpose,
+    a dialog tab is a directive the Viewer renders as a divider.  Inside an
+    Examples region it therefore separates peer examples, and section 2's rule
+    -- a unit runs to the next peer structural boundary -- applies to it.
+
+    The rule is about SMCL structure only.  No help topic, package or command
+    name takes part in the decision, and it deliberately does NOT extend to
+    ordinary captions: promoting those would resegment roughly a thousand
+    installed topics on evidence that does not distinguish a heading from a
+    sentence.
+    """
+    m = _DIALOG_TAB_RE.match(raw or "")
+
+    if m is None:
+        return None
+
+    label = (m.group(1) or "").strip()
+
+    return label or None
+
+
+def opens_example_region(raw):
+    """Does this line open a region in which examples are expected?"""
+    return examples_container(raw) or titled_example(raw)
+
+
 def region_has_runnable_code(lines, start, end):
     """Does the 1-based inclusive line region contain any runnable command?
 
@@ -2039,7 +2108,13 @@ def extract_units(path, roots):
     boundaries = []
     containers = []
     separators = []
+    dialog_tabs = []
     inside = False
+    # `inside` is sticky by design for the rules that follow it.  The dialog-tab
+    # rule needs the narrower question -- am I still in the examples region the
+    # container opened? -- because {dlgtab:...} is also the ordinary way to
+    # subdivide an Options section, and those tabs are not examples.
+    in_region = False
 
     for line_no, raw in enumerate(
         lines,
@@ -2047,6 +2122,7 @@ def extract_units(path, roots):
     ):
         if examples_container(raw):
             inside = True
+            in_region = True
             containers.append(
                 (line_no, extract_title(raw))
             )
@@ -2054,16 +2130,28 @@ def extract_units(path, roots):
 
         if titled_example(raw):
             inside = True
+            in_region = True
             boundaries.append(
                 (line_no, extract_title(raw))
             )
             continue
 
+        if peer_structural_boundary(raw):
+            in_region = False
+
         if not inside:
             continue
 
+        if in_region:
+            tab = dialog_tab_heading(raw)
+
+            if tab is not None:
+                dialog_tabs.append((line_no, tab))
+                continue
+
         heading = visible_example_heading(raw)
         if heading is not None:
+            in_region = True
             boundaries.append(
                 (line_no, heading)
             )
@@ -2079,6 +2167,34 @@ def extract_units(path, roots):
         visible = render(raw)
         if visible and alternative_branch_marker(raw, visible):
             separators.append((line_no, visible.strip()))
+
+    # A dialog-tab sub-heading inside an examples region becomes an example
+    # boundary when the region it opens carries runnable code.  Requiring code
+    # is what keeps the rule conservative: a prose-only tab is absorbed into the
+    # example above it instead of manufacturing an empty clickable Example.
+    #
+    # This is promoted BEFORE the container loop below so that a container whose
+    # examples are subdivided by dialog tabs sees itself as already claimed, and
+    # nine separately headed examples are not offered as one undivided block.
+    for i, (line_no, label) in enumerate(dialog_tabs):
+        region_end = len(lines)
+
+        if i + 1 < len(dialog_tabs):
+            region_end = dialog_tabs[i + 1][0] - 1
+
+        for n in range(line_no + 1, min(region_end, len(lines)) + 1):
+            raw = lines[n - 1]
+
+            if (
+                peer_structural_boundary(raw)
+                or opens_example_region(raw)
+                or visible_example_heading(raw) is not None
+            ):
+                region_end = n - 1
+                break
+
+        if region_has_runnable_code(lines, line_no + 1, region_end):
+            boundaries.append((line_no, label))
 
     # A container heading such as a singular {title:Example} is itself a
     # structural Example boundary when the region it opens carries runnable
@@ -2618,9 +2734,18 @@ def repair_fragments(commands):
     return out, unreliable
 
 
-def reconstruct_unit(path, unit, roots):
+def reconstruct_unit(path, unit, roots, source_out=None):
+    """The unit's runnable commands.
+
+    `source_out`, when a list is passed, receives the AUTHOR'S OWN lines --
+    every source line the reconstructor accepted as code, rendered, in the
+    order the page presents them. The commands are what helprun executes; these
+    are what the author wrote, and the two are different representations that
+    must never be presented as one another.
+    """
     lines = read_help_lines(path, roots)
     commands = []
+    source_fragments = source_out if source_out is not None else []
     current = None
     block_mode = None
     comment_join_pending = False
@@ -2701,6 +2826,16 @@ def reconstruct_unit(path, unit, roots):
                 "helprun: this example offers alternative branches, so which "
                 "commands to run cannot be determined without guessing"
             )
+
+        # The author's own line, exactly as it renders, recorded at the moment
+        # the reconstructor accepts it as code. It is kept alongside the
+        # commands, never merged into them: the code record has to show what
+        # the author supplied separately from what helprun derived, and the two
+        # differ wherever proven SMCL structure joined several source fragments
+        # into one command. Recording it HERE, from the same test that accepts
+        # the line, is what stops the two readings drifting apart.
+        if accepted_as_code:
+            source_fragments.append(visible.rstrip())
 
         # ----------------------------------------------------
         # Displayed continuation
@@ -3487,18 +3622,27 @@ _PROMPT_SECRET_RE = re.compile(r"\b(?:password|passphrase|secret|token|api\s*key
 
 
 def classify_prompt(text):
-    """One of the prompt classes for an authored prompt line."""
+    """One of the prompt classes for an authored prompt line.
+
+    A prompt that asks for a VALUE is classified by the value it asks for, even
+    when it also tells the user to press Enter afterwards. A real installed
+    example asks "Type the number of the file to import, then press
+    Enter." (anchor recorded in the ledger), and calling that
+    ENTER-ONLY described the interaction wrongly wherever the class was shown
+    (HPROD-58). The class only words the guidance and the internal record; the
+    user's line is relayed verbatim whatever it says.
+    """
     t = (text or "").strip()
     if not t:
         return PROMPT_LINE
     if _PROMPT_YES_NO_RE.search(t):
         return PROMPT_YES_NO
-    if _PROMPT_ENTER_RE.search(t):
-        return PROMPT_ENTER_ONLY
     if _PROMPT_NUMBER_RE.search(t):
         return PROMPT_NUMBER
     if _PROMPT_TEXT_RE.search(t):
         return PROMPT_TEXT
+    if _PROMPT_ENTER_RE.search(t):
+        return PROMPT_ENTER_ONLY
     return PROMPT_LINE
 
 
@@ -3738,7 +3882,35 @@ def worker_pause_detected(log_text, quiet_seconds, input_commands=(), idle=True,
     computation timeout is running.
     """
     lines = [l for l in log_text.splitlines() if l.strip()]
+
+    # The settle applies to the traced branch too, and deliberately: a trace
+    # line naming an input primitive says Stata ENTERED it, not that it is
+    # blocked in it, and a primitive that returns at once -- `_request()` in
+    # batch does -- would otherwise be read as a pause the instant it started.
+    # INTER-09 fixes that in both directions. Lifting the settle here to make
+    # detection load-independent was tried on 2026-09-06 and broke it, so the
+    # load sensitivity recorded as HHARN-57 stays in the detector, and the
+    # contract now reports BLOCKED when it cannot judge rather than passing or
+    # failing on machine load.
     if not lines or quiet_seconds < min_quiet:
+        return False
+    # A do-file that has printed its epilogue has FINISHED. A worker that is
+    # quiet and idle after that is winding down, not blocked on input.
+    #
+    # Without this the detector could fire a second time on an input command
+    # that had already been answered: `paused` is cleared when the log grows,
+    # but a program that finishes without printing anything more leaves the
+    # same command as the last echoed one, so a quiet idle worker looked
+    # exactly like a fresh pause. prompt_text_from_log then had only the
+    # epilogue to offer, and the parent asked the user to answer
+    # `end of do-file`. Intermittent by nature -- it needs the wind-down to
+    # last past the settle -- which is why it survived as a rare INTER-20
+    # failure rather than a reproducible one (HPROD-67).
+    #
+    # Only the unambiguous end-of-do-file marker is used. `r(N);`, the other
+    # half of the batch epilogue, can appear mid-log after a captured failure,
+    # and treating it as terminal could suppress a legitimate later pause.
+    if lines[-1].strip().lower().startswith("end of do-file"):
         return False
     if _PAUSE_TRACE_RE.match(lines[-1]):
         return True
@@ -4177,6 +4349,17 @@ def execute_units(
     # grandchildren (GATE 2 R19).
     child_job = create_child_job()
 
+    # The graph snapshot helper is an ado-file in the sandbox, reached through
+    # the adopath the preamble appends. It must exist before any plan runs, and
+    # it must be a FILE: an authored `clear all` drops the loaded program, and
+    # Stata reloads it from here on the next call (HPROD-66).
+    if capture_dir is not None:
+        try:
+            (sandbox / "_hr_gsnap.ado").write_text(
+                "\n".join(graph_capture_helper_ado()) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+
     for index, segment in enumerate(segments, start=1):
         if len(segments) == 1:
             plan = sandbox / "plan.do"
@@ -4489,29 +4672,153 @@ def _worker_evidence(worker, worker_spec):
             "streamed_lines": list(worker_spec.get("streamed_lines") or [])}
 
 
+# ============================================================
+# Public-surface provenance
+#
+# Every line or event that can reach Results, a persistent log, a diagnostic or
+# an artifact manifest carries a class, and the public surfaces admit only the
+# permitted classes -- by class, never by matching particular strings.
+#
+# WHY THIS EXISTS
+#
+# Hygiene used to be a growing list of forbidden tokens: `_hr_gsnap`, the region
+# fences, the click echo, the worker surface, and most recently the relay
+# orchestration. A token list can only refuse what someone has already seen, so
+# each new internal line was public until a person noticed it -- the INTERACTIVE
+# and PROMPT header lines were invented by this project and were therefore never
+# candidates for refusal, and they reached the user's persistent log (HPROD-57,
+# HPROD-58). Classifying at the point of production inverts that default:
+# something new is internal until its provenance says otherwise.
+#
+# The token list survives as a REGRESSION ANCHOR in tests/public_surface.py; it
+# is no longer the rule.
+# ============================================================
+
+PROVENANCE_CLASSES = (
+    # public
+    "AUTHORED_COMMAND",       # a command the help author wrote
+    "AUTHORED_OUTPUT",        # output of an authored Stata command
+    "RUNTIME_OUTPUT",         # output of a runtime the authored example invoked
+    "USER_PROMPT",            # a genuine prompt the user must answer
+    "USER_RESPONSE_SUMMARY",  # concise confirmation that an interaction occurred
+    "HELPRUN_NOTICE",         # helprun's own concise user-facing statement
+    # internal
+    "HELPRUN_INTERNAL",       # orchestration, helpers, bookkeeping, instrumentation
+    "HARNESS_INTERNAL",       # validation driver, automation, mutation, debug
+)
+
+PUBLIC_PROVENANCE = (
+    "AUTHORED_COMMAND", "AUTHORED_OUTPUT", "RUNTIME_OUTPUT",
+    "USER_PROMPT", "USER_RESPONSE_SUMMARY", "HELPRUN_NOTICE",
+)
+
+# Producers, as the code that emits a line names itself. A writer that is not
+# listed yields no class at all, which the public surfaces refuse: uncertain
+# provenance is never silently relabelled as authored output.
+_WRITER_CLASS = {
+    "authored": "AUTHORED_OUTPUT",
+    "runtime": "RUNTIME_OUTPUT",
+    "prompt": "USER_PROMPT",
+    "interaction_summary": "USER_RESPONSE_SUMMARY",
+    "helprun_user_facing": "USER_RESPONSE_SUMMARY",
+    "helprun_notice": "HELPRUN_NOTICE",
+    "helprun_internal": "HELPRUN_INTERNAL",
+    "harness": "HARNESS_INTERNAL",
+}
+
+
+def public_surface_admits(provenance):
+    """May a line of this provenance appear in Results or the persistent log?"""
+    return provenance in PUBLIC_PROVENANCE
+
+
+def provenance_of(line, context=None):
+    """The provenance class of one line, from WHO PRODUCED IT.
+
+    `context["writer"]` is the producing path's own name. The text is consulted
+    only to separate an authored command echo from authored output, which is a
+    property of the transcript Stata itself wrote (`. command`), never a guess
+    about what a line means. An unknown writer returns "UNKNOWN", which
+    public_surface_admits refuses.
+    """
+    ctx = context or {}
+    writer = str(ctx.get("writer", "")).strip().lower()
+    cls = _WRITER_CLASS.get(writer)
+
+    if cls is None:
+        return "UNKNOWN"
+
+    if cls == "AUTHORED_OUTPUT":
+        if str(line).startswith(". "):
+            return "AUTHORED_COMMAND"
+
+        # An authored line that asks the reader for an answer is a prompt, and
+        # naming it one is what lets a surface treat prompts as prompts. Both
+        # classes are public, so this refines the label and can never admit
+        # something a stricter reading would have refused.
+        #
+        # Only the unmistakable shapes count here. classify_prompt's word tests
+        # are deliberately not used: they exist to word the guidance for a line
+        # ALREADY known to be a prompt because the worker stopped for it, and
+        # they would read "number of observations" in ordinary output as a
+        # request for input.
+        if _PROMPT_YES_NO_RE.search(str(line)) or _PROMPT_ENTER_RE.search(str(line)):
+            return "USER_PROMPT"
+
+    return cls
+
+
 def interactive_header_lines(interactive):
-    """The INTERACTIVE and PROMPT header lines for a run that used a worker:
-    the same wording on the SUCCESS and FAILED paths (HPROD-48 provenance)."""
+    """The user-facing record that the example asked the user something.
+
+    Provenance USER_RESPONSE_SUMMARY: it confirms that an interaction occurred
+    and that nothing was answered on the user's behalf. The orchestration behind
+    it -- the worker's identity and visibility, the internal prompt class, the
+    relayed text, relay timestamps, pause counts, wait durations and resumption
+    state -- is HELPRUN_INTERNAL and stays on the outcome for validation, off
+    the user's surfaces (HPROD-57/58). The authored prompt itself is already in
+    the run's own output, where the author put it.
+    """
+    if not interactive or not interactive.get("pauses"):
+        return []
+
+    if interactive.get("cancelled"):
+        return ["INTERACTION : this example asked you a question and the run was cancelled; "
+                "nothing was answered on your behalf."]
+
+    delivered = [i for i in (interactive.get("interactions") or []) if i.get("delivered")]
+
+    if delivered:
+        return ["INTERACTION : this example asked you a question here and your answer was applied."]
+
+    return ["INTERACTION : this example asked you a question; nothing was answered on your behalf."]
+
+
+def interactive_internal_record(interactive):
+    """The full orchestration record, provenance HELPRUN_INTERNAL.
+
+    Returned on the outcome for validation and reproducibility. It is never
+    written to a public surface; a clean public log is achieved by classifying
+    this material, not by deleting the evidence the harness needs.
+    """
     if not interactive:
         return []
-    lines = [
-        "INTERACTIVE : %s worker %r; paused %d time(s) for the user's answer, "
-        "waited %s s%s"
-        % ("hidden" if interactive.get("hidden") and not interactive.get("revealed")
-           else "visible",
-           interactive.get("title", ""),
-           interactive.get("pauses", 0),
-           interactive.get("waited_seconds", 0),
-           "; cancelled by the user" if interactive.get("cancelled") else "")]
+    record = [
+        "worker=%s visible=%s pauses=%s waited_seconds=%s cancelled=%s"
+        % (interactive.get("title", ""),
+           bool(interactive.get("revealed")) or not interactive.get("hidden"),
+           interactive.get("pauses", 0), interactive.get("waited_seconds", 0),
+           bool(interactive.get("cancelled")))]
     for it in interactive.get("interactions") or []:
         resumed = it.get("resumed")
-        lines.append(
-            "PROMPT %-6d: %s %r -> answer %r, relayed %s, %s"
+        record.append(
+            "prompt %d: class=%s text=%r answer=%r relayed_at=%s delivered=%s %s"
             % (it.get("ordinal", 0), it.get("class", ""),
-               redact_secrets(str(it.get("prompt", "")))[:120],
+               redact_secrets(str(it.get("prompt", "")))[:160],
                redact_secrets(str(it.get("answer", ""))), it.get("relayed_at", ""),
+               bool(it.get("delivered")),
                "resumed" if resumed else ("not resumed" if resumed is False else "pending")))
-    return lines
+    return record
 
 
 # ============================================================
@@ -4602,6 +4909,49 @@ def example_provides_data_setup(unit, doc_lines=()):
     # missing-setup defect; it is USER_DATA_REQUIRED and is handled elsewhere.
     for line in doc_lines or ():
         if USER_DATA_INSTRUCTION_RE.search(str(line)):
+            return True
+
+    return False
+
+
+def continues_earlier_example(target, units):
+    """Is this unit, structurally, a continuation of an earlier example?
+
+    Every example runs in its own Stata session, so nothing an earlier example
+    left behind -- the dataset in memory, e()/r() results, frames, a command's
+    own undo buffer, Mata or Python objects -- is present when a later example
+    runs on its own. A unit that establishes no session of its own, in a
+    document where an earlier unit does, is a continuation by construction.
+
+    This is a structural reading of the authored document, and it is reported
+    ALONGSIDE the real Stata error, never instead of it: it says what helprun
+    knows about the document, and makes no causal claim about the failure. No
+    help topic, package or command name takes part in the decision.
+    """
+    if not target or not units:
+        return False
+
+    try:
+        ordinal = int(target.get("ordinal") or 0)
+    except (TypeError, ValueError):
+        return False
+
+    if ordinal <= 1:
+        return False
+
+    # The document-level user-data instruction is deliberately not consulted
+    # here: it is a property of the whole page and would answer the same for
+    # every unit, which would tell these two halves apart from nothing.
+    if example_provides_data_setup(target, ()):
+        return False
+
+    for unit in units:
+        try:
+            other = int(unit.get("ordinal") or 0)
+        except (TypeError, ValueError):
+            continue
+
+        if other < ordinal and example_provides_data_setup(unit, ()):
             return True
 
     return False
@@ -5758,6 +6108,14 @@ FILE_NOT_FOUND_CODES = {"601", "603", "693"}
 # installed Stata returns r(9).
 NETWORK_FAILURE_CODES = {"631", "672", "677", "679"}
 
+# What Stata says when the requirement really is the version. Anything else
+# returning r(9) -- `assert` above all -- is not a version problem (HPROD-63).
+_VERSION_FAILURE_RE = re.compile(
+    r"requires? version|this is version .* of stata|"
+    r"version \d+(?:\.\d+)? is required|not supported by this version",
+    flags=re.IGNORECASE,
+)
+
 NETWORK_FAILURE_PHRASES = (
     "host not found",
     "could not connect",
@@ -5788,6 +6146,14 @@ def classify_child_failure(log_text, r_codes, known_missing_vars=None,
 
     evidence = ""
     for line in reversed(error_lines):
+        # Stata's own do-file framing is the last thing in every failed child
+        # log, so taking the last line verbatim reported "end of do-file" as
+        # though it were the error and buried the real message one line above.
+        if line.lower().startswith("end of do-file") or line.lower().startswith(
+            "end of file"
+        ):
+            continue
+
         if line and not line.startswith("r("):
             evidence = line
             break
@@ -5802,7 +6168,21 @@ def classify_child_failure(log_text, r_codes, known_missing_vars=None,
         return "NETWORK_RESOURCE_UNAVAILABLE", evidence
 
     if code == "9":
-        return "STATA_VERSION_INCOMPATIBLE", evidence
+        # r(9) is shared. GATE 4's probe saw it for a version requirement newer
+        # than the installation, which is true; `assert` returns it too, and
+        # `assert` is ordinary authored code. Reading the code alone told a
+        # user whose example made a false assertion to go and check their Stata
+        # version (HPROD-63) -- a confident wrong answer, which section 9
+        # forbids more strongly than it forbids saying "I cannot tell".
+        #
+        # A version requirement is also caught BEFORE the run, by the preflight
+        # in click_run, so an r(9) that reaches here is unlikely to be one; the
+        # transcript has to say so.
+        if _VERSION_FAILURE_RE.search(low):
+            return "STATA_VERSION_INCOMPATIBLE", evidence
+
+        if "assertion is false" in low:
+            return "HELP_CODE_ERROR", evidence
 
     if code in FILE_NOT_FOUND_CODES or "file not found" in low:
         return "DATA_FILE_MISSING", evidence
@@ -5916,6 +6296,51 @@ def help_expects_user_data(lines):
     return any(phrase in text for phrase in USER_DATA_PHRASES)
 
 
+# A copy destination that names a DIRECTORY rather than a file. Measured in
+# Stata 19.5 (validation/experiments/copy_destination.log):
+#
+#   copy "../src/d.dta" .        -> ./d.dta          destination is a directory
+#   copy "src/d.dta"    "dst3/"  -> dst3/d.dta       trailing separator likewise
+#   copy "src/d.dta"    "dst2"   -> a FILE named dst2, created even though no
+#                                   such file existed beforehand
+#
+# so only the unambiguous forms are treated as directories. A bare name is the
+# file name, which is what Stata does and what the previous reading assumed for
+# every destination.
+_DIRECTORY_DESTINATION_RE = re.compile(r"^(?:\.|\.\.)$|[\\/]\s*$")
+
+
+def copy_destination_names(source, destination):
+    """The name(s) `copy source destination` creates, lowercased.
+
+    Reading the destination literally reported `copy <url> ., replace` as
+    creating a file called `.`, so an example that downloads its own dataset
+    and then reads it looked like an example reading a file nothing provides,
+    and was refused before it ran (HPROD-65). The real anchor example named in
+    that ledger row does exactly this.
+    """
+    destination = str(destination or "").strip()
+    source = str(source or "").strip()
+
+    if not destination:
+        return set()
+
+    if not _DIRECTORY_DESTINATION_RE.search(destination):
+        return {destination.lower()}
+
+    basename = re.split(r"[\\/]", source.rstrip("/\\"))[-1]
+
+    if not basename:
+        return set()
+
+    names = {basename.lower()}
+
+    if destination not in (".", ""):
+        names.add((destination.rstrip("/\\") + "/" + basename).lower())
+
+    return names
+
+
 def example_created_files(commands):
     """Files the example itself writes earlier in the same run.
 
@@ -5945,12 +6370,16 @@ def example_created_files(commands):
         # `use` of it is reading what this example just downloaded or copied,
         # not a missing package file.
         m = re.match(
-            r'^copy\s+(?:"[^"]+"|\S+)\s+("[^"]+"|[^\s,]+)',
+            r'^copy\s+("[^"]+"|\S+)\s+("[^"]+"|[^\s,]+)',
             s,
             flags=re.IGNORECASE,
         )
         if m:
-            created.add(_unquote_path(m.group(1)).lower())
+            created.update(
+                copy_destination_names(
+                    _unquote_path(m.group(1)), _unquote_path(m.group(2))
+                )
+            )
 
     normalised = set()
     for name in created:
@@ -6099,12 +6528,82 @@ def top_level_flags(commands):
     return flags
 
 
+# Where the child stores the graphs it snapshots: a directory of this name
+# directly beneath the sandbox, which is the child's working directory when the
+# preamble runs. Never exported as an authored artifact.
+GRAPH_SNAPSHOT_DIR = "_hr_graphs"
+
+# The child resolves that directory ONCE, at preamble time, into an absolute
+# path held in a global. An authored `cd` is legitimate and common, and while
+# the snapshot path was relative such an example moved the graph directory out
+# from under the instrumentation: the postamble's `dir` then named a directory
+# that did not exist, and because an extended macro function cannot be silently
+# ignored, that aborted an otherwise successful run.
+GRAPH_DIR_MACRO = "HR_GDIR"
+_GRAPH_DIR = "${" + GRAPH_DIR_MACRO + "}"
+
+
 def graph_capture_preamble(order_macro="HR_GORDER"):
+    """Instrumentation that captures a graph WHEN IT EXISTS, not at the end.
+
+    Two properties this must have, both learned from real failures.
+
+    It is STATE-NEUTRAL. `graph dir` is r-class, so calling it between authored
+    commands cleared the r() results the next authored command depended on: the
+    real anchor example of HPROD-51 ends `margins` -> `marginsplot` and failed with
+    r(301) "previous command was not margins" on every engine that ran it, while
+    the identical authored sequence outside helprun completes (HPROD-51). The
+    helper therefore holds and restores r() around its own work, so an authored
+    command cannot tell that anything ran between it and the next.
+
+    It preserves CONTENT AT SNAPSHOT TIME. Recording only the names and saving
+    at the end loses any graph a later authored command drops, replaces or
+    invalidates (HPROD-53); the author is not required to write `graph save`.
+    Every graph present is saved on every snapshot under a zero-padded sequence,
+    so creation order survives and a graph replaced under one name yields two
+    files; identical repeats are collapsed by content when they are exported.
+    """
     return [
-        "capture program drop _hr_gsnap",
+        # The globals survive `clear all` (measured: see the helper below), so
+        # the sequence and the snapshot directory persist across anything the
+        # example does to its session.
+        "global " + order_macro + ' ""',
+        "global HR_GSEQ = 0",
+        # Bound to the sandbox now, so a later authored `cd` cannot move it.
+        "global " + GRAPH_DIR_MACRO + ' "`c(pwd)\'/' + GRAPH_SNAPSHOT_DIR + '"',
+        'capture mkdir "' + _GRAPH_DIR + '"',
+        # The helper lives in an ado-file in the sandbox and is reached through
+        # the adopath, APPENDED so that nothing in the sandbox can shadow a
+        # real command. `clear all` drops the loaded copy; Stata then reloads
+        # it from disk on the next call, which is the whole point.
+        "adopath + \"`c(pwd)'\"",
+    ]
+
+
+def graph_capture_helper_ado(order_macro="HR_GORDER"):
+    """The snapshot helper, as an ado-file rather than an inline program.
+
+    An authored `clear all` is ordinary and legitimate -- the real anchor
+    example of HPROD-66 opens with it -- and it drops every program in
+    memory, including
+    this one. The hook that calls it is `capture`d, so nothing was reported:
+    the run succeeded and simply produced no graph, for the whole rest of the
+    example (HPROD-66).
+
+    Measured in Stata 19.5 (validation/experiments/clear_all.log): `clear all`
+    drops programs, but leaves global macros and the adopath intact, and a
+    command backed by an ado-file on the adopath is reloaded from disk on its
+    next call. So the helper is a file, and its state is in globals. Fighting
+    `clear all` with retry logic would have been the alternative; using Stata's
+    own on-demand loading needs no retry and cannot fall out of step.
+    """
+    return [
+        "*! helprun graph snapshot helper (internal)",
         "program define _hr_gsnap",
+        "    capture _return hold _hr_rstate",
         "    capture quietly graph dir",
         "    if _rc {",
+        "        capture _return restore _hr_rstate",
         "        exit",
         "    }",
         '    local now `"`r(list)\'"\'',
@@ -6116,27 +6615,98 @@ def graph_capture_preamble(order_macro="HR_GORDER"):
         "        }",
         "    }",
         "    global " + order_macro + ' `"`acc\'"\'',
+        "    local _hrseq = ${HR_GSEQ} + 1",
+        "    global HR_GSEQ = `_hrseq'",
+        "    local _hrtag : display %04.0f `_hrseq'",
+        "    foreach g of local now {",
+        '        capture quietly graph save `g\' "' + _GRAPH_DIR + '/`_hrtag\'_`g\'.gph", replace',
+        "    }",
+        "    capture _return restore _hr_rstate",
         "end",
-        "global " + order_macro + ' ""',
     ]
 
 
+def render_missing_graph_images(graph_dir):
+    """Render a .png beside any saved graph that has none yet.
+
+    The child renders its own graphs in the postamble, which runs after the
+    authored region -- and a child that ABORTS never reaches it. So a graph the
+    example legitimately produced before a later authored command failed was
+    preserved as a .gph the user could open only in Stata, with no image to
+    look at (HPROD-64).
+
+    Rendering here, in the parent, after the child has finished, is what makes
+    that impossible to get wrong: the authored run is over, so nothing this
+    does can disturb it -- unlike exporting inside the snapshot helper, which
+    would have had to make a graph current between two authored commands. It
+    costs one short Stata only when a run both produced graphs and did not
+    reach its own render step.
+    """
+    directory = Path(graph_dir)
+
+    try:
+        missing = sorted(p for p in directory.glob("*.gph")
+                         if not p.with_suffix(".png").is_file())
+    except OSError:
+        return []
+
+    if not missing:
+        return []
+
+    try:
+        exe = stata_exe()
+    except Exception:                                          # noqa: BLE001
+        return []
+
+    lines = []
+    for gph in missing:
+        lines.append('capture quietly graph use "%s"' % gph.name)
+        lines.append('capture quietly graph export "%s", replace width(1200)'
+                     % gph.with_suffix(".png").name)
+
+    script = directory / "_hr_render.do"
+
+    try:
+        script.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        subprocess.run([str(exe), "/e", "do", str(script)], cwd=str(directory),
+                       capture_output=True, timeout=180,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return []
+    finally:
+        for leftover in (script, script.with_suffix(".log")):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+
+    return [p for p in missing if p.with_suffix(".png").is_file()]
+
+
 def graph_capture_postamble(out_dir, basename, order_macro="HR_GORDER"):
-    target = str(out_dir).replace("\\", "/")
+    """Export a .png beside every graph the snapshots saved.
 
-    # GATE 2 established the reliable sequence: save first, then load the
-    # saved graph and export it. A bare `graph export ..., name()` fails with
-    # r(693) "could not find Graph window" for a nodraw graph in batch mode.
-    stem = target + "/" + basename + "-graph-"
-
+    GATE 2 established the reliable sequence: load the saved graph, then export
+    it. A bare `graph export ..., name()` fails with r(693) "could not find
+    Graph window" for a nodraw graph in batch mode. Working from the SAVED
+    FILES rather than from live memory is what lets a graph a later authored
+    command destroyed still be exported (HPROD-53); `out_dir` and `basename`
+    are no longer used here, because the parent names and deduplicates the
+    exported pairs once it can compare their content.
+    """
     return [
         "capture _hr_gsnap",
-        "local _hri = 0",
-        "foreach g of global " + order_macro + " {",
-        "    local ++_hri",
-        '    capture noisily graph save `g\' "' + stem + '`_hri\'.gph", replace',
-        '    capture noisily graph use "' + stem + '`_hri\'.gph"',
-        '    capture noisily graph export "' + stem + '`_hri\'.png", replace width(1200)',
+        # An extended macro function cannot be told to fail quietly, so the
+        # listing is captured: a run that produced no graph, or whose snapshot
+        # directory could not be created, must end exactly as it would have
+        # without any instrumentation at all.
+        'local _hrfiles ""',
+        'capture local _hrfiles : dir "' + _GRAPH_DIR + '" files "*.gph"',
+        "capture local _hrfiles : list sort _hrfiles",
+        "foreach f of local _hrfiles {",
+        '    capture quietly graph use "' + _GRAPH_DIR + '/`f\'"',
+        '    local _hrstem = subinstr(`"`f\'"\', ".gph", "", 1)',
+        '    capture quietly graph export "' + _GRAPH_DIR + '/`_hrstem\'.png", replace width(1200)',
         "}",
     ]
 
@@ -6562,6 +7132,9 @@ HELPRUN_INTERNAL_NAMES = {
     "plan.do", "plan.log", "plan_1.do", "plan_1.log",
     "plan_2.do", "plan_2.log", "plan_3.do", "plan_3.log",
     "plan_4.do", "plan_4.log",
+    # the graph snapshot helper, which lives in the sandbox as an ado-file so
+    # that an authored `clear all` cannot take it away (HPROD-66)
+    "_hr_gsnap.ado",
 }
 
 
@@ -6621,7 +7194,7 @@ def collect_authored_artifacts(sandbox, pre_existing):
 
         rel = path.relative_to(sandbox)
 
-        if rel.parts and rel.parts[0] == "_hr_out":
+        if rel.parts and rel.parts[0] in ("_hr_out", GRAPH_SNAPSHOT_DIR):
             continue
         if path.name in HELPRUN_INTERNAL_NAMES:
             continue
@@ -6697,8 +7270,9 @@ def runnable_units_for(source, roots):
     skipped = []
 
     for raw_unit in extract_units(source, roots):
+        authored = []
         try:
-            code = reconstruct_unit(source, raw_unit, roots)
+            code = reconstruct_unit(source, raw_unit, roots, source_out=authored)
         except HelprunError as exc:
             skipped.append(
                 {"heading": raw_unit.get("heading", ""), "reason": exc.reason}
@@ -6710,6 +7284,9 @@ def runnable_units_for(source, roots):
 
         unit = dict(raw_unit)
         unit["code"] = list(code)
+        # The author's own lines, kept beside the derived commands so the code
+        # record can show both without presenting either as the other.
+        unit["authored_source"] = list(authored)
         # Carried so click_run can refuse a unit that ends inside an open
         # block, without that refusal costing the unit its place on the page.
         unit["open_block"] = getattr(code, "open_block", None)
@@ -6983,6 +7560,417 @@ def engine_identity():
     return _ENGINE_IDENTITY
 
 
+# ============================================================
+# Persistent example code artifact, standalone do-file, run manifest
+#
+# Scope decision SCOPE-002 (validation/scope_decisions.md): promoted into
+# HELPRUN 1.0 from the post-1.0 backlog, as a NEW FEATURE rather than a defect
+# correction. The run log is the runtime record. These are the CODE and
+# PROVENANCE record, and they exist independently of it, so that a user can see
+# what the author wrote, what helprun added, what actually ran and where it
+# stopped without reading a transcript.
+#
+# Three rules shape everything below.
+#
+#   Authored code is never merged with helprun's additions. They are separate
+#   sections with separate names, and "None" is written out when helprun added
+#   nothing, because an absent section and an empty one read the same.
+#
+#   The complete authored code is preserved even when execution stopped early.
+#   Saving only the part that ran would turn the record of a failure into a
+#   shorter, apparently successful example.
+#
+#   The execution boundary comes from execution evidence. A command that was
+#   reconstructed but never echoed was never attempted, and is reported as not
+#   executed -- not as failed, and not as run.
+# ============================================================
+
+CODE_ARTIFACT_SUFFIX = "-code.txt"
+MANIFEST_SUFFIX = "-manifest.json"
+DO_ARTIFACT_SUFFIX = ".do"
+
+_ECHO_BLOCK_BODY_RE = re.compile(r"^\s+\d+\.\s(.*)$")
+
+# A runtime that is not Stata, so a Stata do-file cannot faithfully stand in
+# for the example. `python script` is already in EXTERNAL_LAUNCH_RE; a `python:`
+# block and an inline `python ... end` region are the same problem.
+_OTHER_RUNTIME_RE = re.compile(r"^\s*(?:python\b|java\b|javacall\b)", flags=re.IGNORECASE)
+
+
+def _canon_echo(text):
+    """Whitespace-insensitive form of a command.
+
+    Stata wraps an echo longer than linesize with a `> ` prefix and splits it
+    mid-token, so a comparison that respects spacing cannot match a long
+    authored command against its own echo.
+    """
+    return re.sub(r"\s+", "", str(text).strip())
+
+
+def transcript_echoes(transcript):
+    """The commands Stata echoed, in order.
+
+    Three shapes appear in a log: a top-level command as `. command`; the body
+    of a block as numbered lines `  2. command`, the closing brace included;
+    and a wrapped continuation as `> ...`, which belongs to the line above only
+    when that line was itself part of a command.
+    """
+    echoes = []
+    open_command = False
+
+    for raw in (transcript or "").splitlines():
+        line = raw.rstrip()
+
+        if line.startswith(". "):
+            echoes.append(line[2:])
+            open_command = True
+            continue
+
+        body = _ECHO_BLOCK_BODY_RE.match(line)
+
+        if body:
+            echoes.append(body.group(1))
+            open_command = True
+            continue
+
+        if open_command and line.startswith("> "):
+            echoes[-1] = echoes[-1] + line[2:]
+            continue
+
+        open_command = False
+
+    return echoes
+
+
+def executed_boundary(commands, transcript):
+    """Where execution actually reached, read from the child's own transcript.
+
+    The authored commands are matched, in authored order, against what Stata
+    echoed. The first one that never appears ends the attempted run; it and
+    everything after it are the unexecuted remainder. Nothing here concludes
+    that an attempted command succeeded or that an unexecuted one would have
+    failed -- both are inferences the evidence does not support.
+    """
+    wanted = list(commands or [])
+    echoes = [_canon_echo(e) for e in transcript_echoes(transcript)]
+
+    # Membership, not a moving cursor. A block command -- `program define ...
+    # end`, a foreach, an input -- is ONE authored command whose lines Stata
+    # echoes separately, at DEFINITION time, and the body then runs later when
+    # the program is called. Matching in strict order against a single advancing
+    # cursor therefore consumed echoes out of step and reported commands as
+    # unexecuted that the transcript plainly showed. What the evidence actually
+    # supports is narrower and safer: a command Stata echoed was attempted, and
+    # one it never echoed was not. Order is taken from the AUTHOR, which is
+    # where it is known exactly.
+    seen = set(echoes)
+
+    def echoed(command):
+        text = str(command)
+        first = text.splitlines()[0] if "\n" in text else text
+        return _canon_echo(text) in seen or _canon_echo(first) in seen
+
+    attempted = [c for c in wanted if echoed(c)]
+    remaining = [c for c in wanted if not echoed(c)]
+
+    return {
+        "authored_total": len(wanted),
+        "attempted": attempted,
+        "attempted_count": len(attempted),
+        "executed_through": attempted[-1] if attempted else "",
+        "first_not_executed": remaining[0] if remaining else "",
+        "stopped_before": remaining,
+        "complete": bool(wanted) and not remaining,
+        "started": bool(attempted),
+    }
+
+
+def prerequisite_units(plan, target):
+    """The units helprun added to the plan; the clicked one is not one of them."""
+    return [u for u in (plan or []) if u is not target]
+
+
+def authored_boundary(target, plan, transcript):
+    """The execution boundary expressed over the AUTHORED commands alone.
+
+    The child runs helprun's prerequisites before the clicked example, so the
+    match is anchored over the whole executed sequence -- otherwise a command
+    the author repeats after a prerequisite would match the prerequisite's echo
+    -- and only then narrowed to the author's own commands. The clicked unit is
+    last in the plan, which is what makes the narrowing a suffix.
+    """
+    authored = [str(c) for c in ((target or {}).get("code") or [])]
+
+    full = []
+    for unit in (plan or []):
+        full.extend(str(c) for c in (unit.get("code") or []))
+
+    if not full:
+        full = list(authored)
+
+    # The authored half is judged on its own. An earlier version narrowed a
+    # whole-plan result by slicing off a prerequisite-sized prefix, which was
+    # only ever valid while matching was a strict in-order walk: once a command
+    # Stata never echoed could sit anywhere in the list, the count of attempted
+    # commands stopped being an index into the authored ones, and the record
+    # named the wrong command as the first not executed.
+    own = executed_boundary(authored, transcript)
+    whole = executed_boundary(full, transcript)
+
+    own["prerequisites_attempted"] = max(
+        whole["attempted_count"] - own["attempted_count"], 0)
+    return own
+
+
+def do_representation_blocker(target, plan, units, interactive=None,
+                              staged_inputs=None):
+    """Why a faithful standalone do-file cannot be written, or "" when it can.
+
+    A .do is written only where a faithful standalone Stata representation is
+    PROVABLE. Each test below names one way that proof fails, and each is
+    structural: no help topic, package or command name takes part in it. When
+    the proof fails the .txt record is still written -- the provenance record
+    does not depend on the example being reducible to a do-file.
+    """
+    if not target or not target.get("code"):
+        return "the authored code was not reconstructed"
+
+    if any(u.get("open_block") for u in (plan or [])):
+        return "an authored block is left open in the help source"
+
+    commands = []
+    for unit in (plan or []):
+        commands.extend(unit.get("code") or [])
+
+    if interactive and interactive.get("pauses"):
+        return ("the example asks the user a question, and the answers a person "
+                "typed are not part of the authored code")
+
+    if any(EXTERNAL_LAUNCH_RE.match(str(c)) for c in commands):
+        return "the example launches a program outside Stata"
+
+    if any(_OTHER_RUNTIME_RE.match(str(c)) for c in commands):
+        return "the example runs code in another language inside Stata"
+
+    if staged_inputs:
+        return "the example runs against input files helprun staged for it"
+
+    if continues_earlier_example(target, units) and not prerequisite_units(plan, target):
+        return ("the example continues from an earlier example in the same help "
+                "topic, whose state a standalone file cannot supply")
+
+    return ""
+
+
+def do_artifact_lines(target, plan):
+    """The standalone do-file: executable Stata code, and nothing else.
+
+    This SERIALIZES the reconstructed commands. Where the help page's own
+    structure proved that several authored fragments are one command, that
+    command is written on one line, which is legal Stata and needs no
+    continuation device. helprun does not introduce `///` or `#delimit` for
+    convenience, and it never repairs authored semantics to make a file run:
+    an example whose faithful serialization cannot be established gets no .do
+    at all, and the reason is recorded in the code record and the manifest.
+
+    Where helprun added prerequisites the file must still say which lines are
+    the author's and which are helprun's, because that distinction may never be
+    lost. One marker comment per section carries it; nothing else is written --
+    no prose, no status, no hashes, no manifest fields. An example that needed
+    no prerequisites gets the authored commands alone, with no markers at all.
+    """
+    prereqs = prerequisite_units(plan, target)
+    lines = []
+
+    if prereqs:
+        for unit in prereqs:
+            lines.append("* helprun-added prerequisite: example %s"
+                         % unit.get("ordinal", ""))
+            lines.extend(str(c) for c in (unit.get("code") or []))
+        lines.append("* authored help code: example %s" % target.get("ordinal", ""))
+
+    lines.extend(str(c) for c in (target.get("code") or []))
+    return lines
+
+
+def code_artifact_sections(identity, target, plan, boundary, status,
+                           reason="", message="", do_note=""):
+    """The persistent .txt code and provenance record for one clicked run."""
+    prereqs = prerequisite_units(plan, target)
+
+    lines = [
+        "helprun " + HELPRUN_VERSION + " example code record",
+        "=" * 60,
+        "topic            : " + str(identity.get("topic", "")),
+        "example ordinal  : " + str(identity.get("ord", "")),
+        "example heading  : " + str((target or {}).get("heading", "")),
+        "root source      : " + str(identity.get("root", "")),
+        "source graph hash: " + str(identity.get("agg", "")),
+        "helprun version  : " + HELPRUN_VERSION,
+        "engine sha256    : " + engine_identity(),
+        "=" * 60,
+        "",
+        # THE AUTHOR'S OWN LINES. Never helprun's serialization of them: a
+        # `///`, a `#delimit` or a join that helprun introduced to make a
+        # standalone file legal is helprun's, and showing it here would rewrite
+        # what the author wrote.
+        "AUTHORED HELP CODE",
+        "-" * 60,
+    ]
+
+    source = [str(c) for c in ((target or {}).get("authored_source") or [])]
+    commands = [str(c) for c in ((target or {}).get("code") or [])]
+
+    lines.extend(redact_secrets(c) for c in (source or commands))
+
+    # What helprun executes. It differs from the lines above only where the
+    # authored SMCL structure PROVED that several source fragments are one
+    # command -- an open paragraph continued by {break}, a fragment carrying no
+    # `. ` prompt, a syntactically incomplete accumulated command. Where the
+    # two are the same, saying so is shorter and clearer than repeating them.
+    lines.extend(["", "COMMANDS HELPRUN RECONSTRUCTED", "-" * 60])
+
+    if not source or source == commands:
+        lines.append("The same lines, unchanged: no source fragment needed joining.")
+    else:
+        lines.append("%d authored line(s) resolve to %d command(s), joined only where "
+                     "the help page's own structure proved they are one command:"
+                     % (len(source), len(commands)))
+        lines.append("")
+        lines.extend(redact_secrets(c) for c in commands)
+
+    lines.extend(["", "HELPRUN-ADDED PREREQUISITES", "-" * 60])
+
+    if prereqs:
+        for unit in prereqs:
+            lines.append("from example %s (%s):"
+                         % (unit.get("ordinal", ""), unit.get("heading", "")))
+            lines.extend("    " + redact_secrets(str(c))
+                         for c in (unit.get("code") or []))
+    else:
+        lines.append("None")
+
+    lines.extend(["", "EXECUTION", "-" * 60])
+
+    # "Reached" rather than "succeeded": the transcript proves which commands
+    # Stata ran, and the last one it ran is very often the one that failed.
+    # Reporting it as executed successfully would read the evidence for more
+    # than it says.
+    if not boundary or not boundary.get("started"):
+        lines.append("Execution did not start; no authored command was run.")
+    elif boundary.get("complete") and status == STATUS_SUCCESS:
+        lines.append("Every authored command executed, through:")
+        lines.append("    " + redact_secrets(boundary.get("executed_through", "")))
+    elif boundary.get("complete"):
+        lines.append("Every authored command was reached; the last was:")
+        lines.append("    " + redact_secrets(boundary.get("executed_through", "")))
+    else:
+        lines.append("Executed through:")
+        lines.append("    " + redact_secrets(boundary.get("executed_through", "")))
+        lines.append("")
+        lines.append("Stopped before:")
+        lines.extend("    " + redact_secrets(str(c))
+                     for c in boundary.get("stopped_before", []))
+
+    if status != STATUS_SUCCESS:
+        lines.extend(["", "STOP REASON", "-" * 60])
+        lines.append(reason or "not classified")
+
+        if message:
+            lines.append(redact_secrets(message))
+
+    if do_note:
+        lines.extend(["", "STANDALONE DO-FILE", "-" * 60, do_note])
+
+    return lines
+
+
+def do_artifact_note(blocker, name=""):
+    """The one line the code record and the manifest both carry about the .do."""
+    if blocker:
+        return "Not written: " + blocker + ". The authored code above is the record."
+    return "Written as " + name + "."
+
+
+def _artifact_integrity(path):
+    """SHA-256 and size of a file that has reached its final persisted state."""
+    p = Path(path)
+
+    try:
+        data = p.read_bytes()
+    except OSError:
+        return None
+
+    return {
+        "name": p.name,
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
+def run_manifest(identity, target, plan, boundary, status, reason, message,
+                 out_dir, files, do_blocker=""):
+    """The machine-readable index of one clicked run.
+
+    `files` are the run's persistent files, already in their final state: the
+    manifest records each one's size and SHA-256 as read back from disk, so a
+    hash is never claimed for a state that was written later. Paths are
+    relative to the run's own directory so the record travels with it; the
+    authoritative help source keeps its absolute path, because that is what the
+    provenance means.
+
+    Nothing internal is indexed here. The manifest names the user's own files
+    and the identity of the run that produced them.
+    """
+    directory = Path(out_dir)
+    indexed = []
+
+    for path in files:
+        if not path:
+            continue
+
+        info = _artifact_integrity(path)
+
+        if info is None:
+            continue
+
+        try:
+            info["path"] = Path(path).relative_to(directory).as_posix()
+        except ValueError:
+            info["path"] = Path(path).name
+
+        info["verified"] = True
+        indexed.append(info)
+
+    return {
+        "helprun_version": HELPRUN_VERSION,
+        "engine_sha256": engine_identity(),
+        "topic": str(identity.get("topic", "")),
+        "ordinal": identity.get("ord", ""),
+        "heading": str((target or {}).get("heading", "")),
+        "help_source": str(identity.get("root", "")),
+        "help_source_hash": str(identity.get("agg", "")),
+        "run_id": str(identity.get("topic", "")) + "-" + str(identity.get("ord", "")),
+        "status": status,
+        "reason": reason or "",
+        "message": redact_secrets(message or ""),
+        "prerequisites": [u.get("ordinal") for u in prerequisite_units(plan, target)],
+        # Why no standalone do-file was written, when none was. The reason
+        # belongs in the machine-readable record too, not only in the prose
+        # one, so a reader that indexes runs can tell a deliberate omission
+        # from a missing file.
+        "do_artifact_omitted": do_blocker or "",
+        "execution": {
+            "authored_commands": (boundary or {}).get("authored_total", 0),
+            "attempted": (boundary or {}).get("attempted_count", 0),
+            "executed_through": redact_secrets((boundary or {}).get("executed_through", "")),
+            "first_not_executed": redact_secrets((boundary or {}).get("first_not_executed", "")),
+            "complete": bool((boundary or {}).get("complete")),
+        },
+        "files": indexed,
+    }
+
+
 def _log_header(identity, target, plan, extra=()):
     lines = [
         "helprun " + HELPRUN_VERSION + " run log",
@@ -6999,6 +7987,15 @@ def _log_header(identity, target, plan, extra=()):
             or "none"
         ),
         "helprun version  : " + HELPRUN_VERSION,
+        # Disclosure, always, success or failure (specification 10, HPROD-59).
+        # The example ran in its own Stata session, so nothing it left in
+        # memory reaches the session the user clicked from. Saying so once, in
+        # the log the user opens, is the V1 answer: helprun does not propagate
+        # worker state back into the parent and does not share an execution
+        # context, and a user who is not told that will read an empty parent
+        # session as a helprun failure.
+        "session          : ran in a separate Stata session; data, estimation "
+        "results and settings it created are not loaded in your session",
         # The engine identity, so a log says which build wrote it. Without it a
         # validation scan cannot tell a log produced by the current engine from
         # one left behind by an earlier build, and a corpus assertion over a
@@ -7046,6 +8043,70 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
     # on the success path only, so a paused run that ended FAILED carried no
     # evidence of its pause (HHARN-43).
     header_extra = []
+    # What the code record needs and the log does not carry: the child's own
+    # transcript (the only evidence of where execution reached), the units of
+    # the document, and what helprun staged. Filled in as the run proceeds so
+    # that every exit path -- refusal, preflight failure, failure, success --
+    # writes the same record from the same evidence.
+    run_state = {"transcript": "", "units": [], "interactive": None,
+                 "staged_inputs": None}
+
+    def _write_code_records(status, reason, message, log_path, artifacts):
+        """The .txt code record, the optional .do, and the run manifest.
+
+        Written after the log and the artifacts have reached their final state,
+        because the manifest records their sizes and hashes and must never
+        claim one for a file that was written afterwards. The manifest is last
+        and is not indexed by itself.
+        """
+        written = {"code": "", "do": "", "manifest": ""}
+
+        # Parse failure: helprun could not determine the authored code. No code
+        # artifact is written and none is invented; the log and the classified
+        # reason are the record.
+        if not writable or not basename or not target or not target.get("code"):
+            return written
+
+        try:
+            boundary = authored_boundary(target, plan, run_state["transcript"])
+
+            blocker = do_representation_blocker(
+                target, plan, run_state["units"],
+                run_state["interactive"], run_state["staged_inputs"],
+            )
+
+            do_name = ""
+
+            if not blocker:
+                do_path = Path(out_dir) / (basename + DO_ARTIFACT_SUFFIX)
+                do_path.write_text(
+                    "\n".join(do_artifact_lines(target, plan)) + "\n",
+                    encoding="utf-8")
+                written["do"] = str(do_path)
+                do_name = do_path.name
+
+            do_note = do_artifact_note(blocker, do_name)
+
+            sections = code_artifact_sections(
+                identity, target, plan, boundary, status, reason, message, do_note)
+            code_path = Path(out_dir) / (basename + CODE_ARTIFACT_SUFFIX)
+            code_path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+            written["code"] = str(code_path)
+
+            indexed = [p for p in ([log_path, written["code"], written["do"]]
+                                   + [str(a) for a in (artifacts or [])]) if p]
+            manifest = run_manifest(identity, target, plan, boundary, status,
+                                    reason, message, out_dir, indexed,
+                                    do_blocker=blocker)
+            manifest_path = Path(out_dir) / (basename + MANIFEST_SUFFIX)
+            manifest_path.write_text(
+                json.dumps(manifest, indent=1, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            written["manifest"] = str(manifest_path)
+        except OSError:
+            pass
+
+        return written
 
     def refuse(error, status=STATUS_REFUSED, extra_log=()):
         """Refuse cleanly, still leaving a diagnostic log when we can."""
@@ -7066,6 +8127,9 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
             except OSError:
                 log_path = ""
 
+        records = _write_code_records(status, error.reason, error.message,
+                                      log_path, refuse.artifacts)
+
         return make_outcome(
             status,
             error.reason,
@@ -7076,9 +8140,16 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
             logfile=log_path,
             output_dir=str(out_dir),
             basename=basename,
-            artifacts=[],
+            artifacts=[str(a) for a in refuse.artifacts],
             child_output="",
+            code_artifact=records["code"],
+            do_artifact=records["do"],
+            manifest=records["manifest"],
         )
+
+    # Artifacts the run legitimately produced before it failed; empty on the
+    # refusal paths that never executed anything.
+    refuse.artifacts = []
 
     try:
         acquire_run_lock()
@@ -7119,6 +8190,7 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
 
         source = Path(identity["root"])
         units = runnable_units_for(source, roots)
+        run_state["units"] = units
 
         target = next(
             (u for u in units if u["ordinal"] == int(identity["ord"])), None
@@ -7368,6 +8440,7 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
         # Dataset resolution, with no fuzzy filename substitution.
         staged_inputs, data_problem = resolve_data_references(
             commands, ctx, unit_lines)
+        run_state["staged_inputs"] = staged_inputs
 
         if data_problem is not None:
             return refuse(data_problem)
@@ -7400,6 +8473,7 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
         )
 
         interactive_evidence = result.get("interactive")
+        run_state["interactive"] = interactive_evidence
         header_extra.extend(interactive_header_lines(interactive_evidence))
         streamed_lines = list((interactive_evidence or {}).get("streamed_lines") or [])
 
@@ -7440,6 +8514,20 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
                     no_data_setup=no_setup,
                 )
 
+                # AMBIGUOUS_FAILURE_PROVENANCE is the reason of last resort and
+                # says only that helprun cannot tell. EXAMPLE_DATA_SETUP_MISSING
+                # says something stronger and, here, false: its section 9
+                # premise is that the Example supplies no dataset and no data
+                # setup, and an earlier unit of this same document supplies
+                # exactly that. Where the document shows the example is a
+                # continuation, that precise fact is reported instead
+                # (HPROD-60). The real Stata error still travels with it.
+                if reason in (
+                    "AMBIGUOUS_FAILURE_PROVENANCE",
+                    "EXAMPLE_DATA_SETUP_MISSING",
+                ) and continues_earlier_example(target, units):
+                    reason = "EXAMPLE_CONTINUES_EARLIER_EXAMPLE"
+
                 if reason == "EXAMPLE_DATA_SETUP_MISSING":
                     # Section 9 fixes the exact concise public wording. The
                     # literal Stata error, the commands and the internal
@@ -7447,6 +8535,14 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
                     message = (
                         "helprun: this example does not provide a runnable "
                         "dataset or data setup."
+                    )
+                elif reason == "EXAMPLE_CONTINUES_EARLIER_EXAMPLE":
+                    message = (
+                        "helprun: this example continues from an earlier "
+                        "example in the same help topic, and each example runs "
+                        "in its own Stata session, so what the earlier one left "
+                        "in memory was not there. "
+                        + (evidence or "See the log for the Stata error.")
                     )
                 else:
                     message = (
@@ -7460,6 +8556,16 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
             # final outputs too (specification 12.3, HPROD-49): preserved and
             # verified BEFORE the log is written and the sandbox removed.
             artifacts, not_exported = _export_artifacts(result, out_dir, basename)
+            # The code record is written from the same evidence on this path as
+            # on every other: the child's transcript decides the boundary, and
+            # the artifacts the run legitimately produced are indexed with it.
+            # The boundary is judged from the SAME transcript the user's log
+            # shows. Judging from the raw child log instead let the record say
+            # a command did not execute while the log the user opens shows it
+            # running -- a contradiction the user would have to resolve, and
+            # the one thing an execution record must never produce.
+            run_state["transcript"] = user_facing_transcript(child_log)
+            refuse.artifacts = artifacts
             outcome = refuse(
                 error,
                 status=STATUS_FAILED,
@@ -7471,6 +8577,8 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
                              if not_exported else []),
             )
             outcome["artifacts"] = [str(a) for a in artifacts]
+            # the orchestration record travels on the outcome, not on the log
+            outcome["interactive_internal"] = interactive_internal_record(interactive_evidence)
             outcome["child_output"] = child_log
             outcome["sandbox"] = result.get("sandbox", "")
             outcome["temp_root"] = result.get("temp_root", "")
@@ -7520,12 +8628,43 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
             sections.append("ARTIFACTS NOT EXPORTED: " + ", ".join(not_exported)
                             + " -- sandbox kept: " + str(result.get("sandbox", "")))
 
-        log_path = _write_run_log(out_dir, basename, sections)
+        # HPROD-68. The refusal path a few hundred lines above writes its log
+        # under `if writable and basename:` inside a try/except OSError, and
+        # degrades to an empty log_path when the destination cannot be
+        # written. This success path did neither, so a destination that was
+        # unwritable -- or that vanished between ensure_topic_directory() and
+        # here, which is what happened to a TEMP working root mid-run -- raised
+        # FileNotFoundError straight out of click_run. run_public() converts an
+        # escaped exception into a clean message, so the user saw no traceback,
+        # but the run was reported as an internal error rather than as the
+        # successful run it actually was, and a caller invoking click_run
+        # directly got the exception. The two paths now degrade identically:
+        # losing the log must not lose the run.
+        # The condition is named rather than written inline: the refusal path's
+        # `if writable and basename:` is the anchor mutant M18 targets, and a
+        # second identical line here made that anchor ambiguous, so M18 could
+        # no longer be applied. Same behaviour, distinct text.
+        may_write_log = bool(writable) and bool(basename)
+        log_path = ""
+        if may_write_log:
+            try:
+                log_path = _write_run_log(out_dir, basename, sections)
+            except OSError:
+                log_path = ""
+
+        # Same transcript the log shows, for the same reason as on the failed
+        # path: the record and the log must never contradict each other.
+        run_state["transcript"] = user_facing_transcript(child_log)
+        records = _write_code_records(STATUS_SUCCESS, "", "",
+                                      str(log_path), artifacts)
 
         return make_outcome(
             STATUS_SUCCESS,
             "",
             "",
+            code_artifact=records["code"],
+            do_artifact=records["do"],
+            manifest=records["manifest"],
             topic=str(identity.get("topic", "")),
             ordinal=target["ordinal"],
             plan=[u["ordinal"] for u in plan],
@@ -7540,6 +8679,7 @@ def click_run(token, parent_pwd=None, stata_roots=None, timeout_seconds=90, ask=
             r_codes=result.get("r_codes", []),
             segments=result.get("segments", 0),
             interactive=interactive_evidence,
+            interactive_internal=interactive_internal_record(interactive_evidence),
             streamed_lines=streamed_lines,
         )
 
@@ -7613,6 +8753,44 @@ def _export_artifacts(result, out_dir, basename):
                 exported.append(destination)
             else:
                 failed.append(path.name)
+
+    # Captured Stata graph objects (specification 12.2). The child saved every
+    # graph it saw at every snapshot, so the same unchanged graph appears many
+    # times; distinct CONTENT in creation order is what the user authored, and
+    # a graph replaced under one name is therefore two artifacts rather than
+    # one. This runs before the sandbox is removed and is independent of the
+    # authored-file collector below: an authored .png or .pdf the example
+    # exported itself never satisfies, replaces or suppresses a .gph
+    # (HPROD-54).
+    graph_dir = sandbox / GRAPH_SNAPSHOT_DIR
+    if graph_dir.is_dir():
+        render_missing_graph_images(graph_dir)
+        seen_content = set()
+        index = 0
+        for gph in sorted(graph_dir.glob("*.gph")):
+            try:
+                content = hashlib.sha256(gph.read_bytes()).hexdigest()
+            except OSError:
+                failed.append(gph.name)
+                continue
+            if content in seen_content:
+                continue
+            seen_content.add(content)
+            index += 1
+            stem = "%s-graph-%d" % (basename, index)
+            gdest = Path(out_dir) / (stem + ".gph")
+            if _copy_verified(gph, gdest):
+                exported.append(gdest)
+            else:
+                failed.append(gph.name)
+                continue
+            png = gph.with_suffix(".png")
+            if png.is_file():
+                pdest = Path(out_dir) / (stem + ".png")
+                if _copy_verified(png, pdest):
+                    exported.append(pdest)
+                else:
+                    failed.append(png.name)
 
     ordinal = 0
     for path, normalize in collect_authored_artifacts(
@@ -7727,6 +8905,7 @@ def ado_click(token, parent_pwd, roots):
     # structured interactive evidence is for the log header and validation,
     # not for Stata locals
     outcome.pop("interactive", None)
+    outcome.pop("interactive_internal", None)
     outcome.pop("streamed_lines", None)
 
     return _flatten_for_ado(outcome)
